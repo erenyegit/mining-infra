@@ -1236,5 +1236,13 @@ mod tests {
 }
 
 #[cfg(test)]
+#[path = "nu7_fixture.rs"]
+mod nu7_fixture;
+
+#[cfg(test)]
 #[path = "nu7_transport_tests.rs"]
 mod nu7_transport_tests;
+
+#[cfg(test)]
+#[path = "nu7_relay_path_tests.rs"]
+mod nu7_relay_path_tests;
