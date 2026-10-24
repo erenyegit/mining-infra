@@ -736,18 +736,9 @@ where
                                     );
                                     continue;
                                 }
-                                let parent_height = if compact.header.len() >= 36 {
-                                    let mut prev_hash = [0u8; 32];
-                                    prev_hash.copy_from_slice(&compact.header[4..36]);
-                                    chain_view
-                                        .height_of(rpc.as_ref(), &prev_hash)
-                                        .await
-                                        .ok()
-                                        .flatten()
-                                        .unwrap_or(0)
-                                } else {
-                                    0
-                                };
+                                let parent = chain_view
+                                    .observe_candidate_parent(rpc.as_ref(), &compact.header)
+                                    .await;
                                 let outcome = {
                                     let mut gate_guard = gate.lock().await;
                                     handle_relay_compact_block_with_gate(
@@ -755,7 +746,7 @@ where
                                         &compact,
                                         mode,
                                         &mut gate_guard,
-                                        parent_height,
+                                        parent.as_ref(),
                                     )
                                     .await
                                 };
@@ -870,18 +861,9 @@ where
                                              let raw_outcome = if let (Some(gate), Some(chain_view)) =
                                                  (&gate, &chain_view)
                                             {
-                                                let parent_height = if raw_block.len() >= 36 {
-                                                    let mut prev_hash = [0u8; 32];
-                                                    prev_hash.copy_from_slice(&raw_block[4..36]);
-                                                    chain_view
-                                                        .height_of(rpc.as_ref(), &prev_hash)
-                                                        .await
-                                                        .ok()
-                                                        .flatten()
-                                                        .unwrap_or(0)
-                                                } else {
-                                                    0
-                                                };
+                                                let parent = chain_view
+                                                    .observe_candidate_parent(rpc.as_ref(), &raw_block)
+                                                    .await;
                                                 let mut gate_guard = gate.lock().await;
                                                 handle_relay_raw_block_with_gate(
                                                     submitter.as_ref(),
@@ -889,7 +871,7 @@ where
                                                     Some(block_hash),
                                                     mode,
                                                     &mut gate_guard,
-                                                    parent_height,
+                                                    parent.as_ref(),
                                                 )
                                                 .await
                                             } else {
