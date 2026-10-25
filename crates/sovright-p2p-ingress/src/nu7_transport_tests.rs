@@ -1,7 +1,10 @@
 //! Isolated qualification only: no production testnet output gate is changed.
+use super::nu7_fixture::{Nu7Fixture, tx_cache};
 use super::*;
+use sovright_relay::RelayPayload;
 use sovright_relay_sidecar::submit::{
     SubmissionOutcome, SubmitBlockMode, handle_relay_compact_block,
+    handle_relay_compact_block_with_mempool,
 };
 
 struct NeverSubmit;
@@ -13,8 +16,7 @@ impl sovright_relay_sidecar::submit::SubmitBlock for NeverSubmit {
 
 #[tokio::test]
 async fn real_nu7_authenticated_udp_reaches_sidecar_candidate() {
-    let raw =
-        hex::decode(include_str!("../tests/fixtures/testnet_nu7_4465026.hex").trim()).unwrap();
+    let raw = Nu7Fixture::load().raw;
     use sovright_relay::{EquihashPowValidator, PowResult, PowValidator, ZCASH_FULL_HEADER_SIZE};
     assert_eq!(
         EquihashPowValidator.validate(&raw[..ZCASH_FULL_HEADER_SIZE]),
@@ -34,7 +36,140 @@ async fn real_nu7_authenticated_udp_reaches_sidecar_candidate() {
     );
 }
 
+/// Cached compact and skeleton for the same NU7 block through the
+/// authenticated loopback relay. The skeleton is a separate relay object (v3
+/// skeleton FEC profile) that only `recv_payload` returns. No packet loss.
+#[tokio::test]
+async fn real_nu7_cached_compact_and_skeleton_cross_authenticated_udp() {
+    use sovright_relay::ZCASH_FULL_HEADER_SIZE;
+    let fixture = Nu7Fixture::load();
+    let origin = tx_cache();
+    origin.insert(fixture.v5_wtxid(), fixture.v5_transaction());
+
+    let mut skeleton = None;
+    let mut cached = None;
+    let (forwarded, finished) = relay_loopback(
+        &fixture.raw,
+        BridgeMode {
+            compact_from_tx_cache: true,
+            skeleton_first: true,
+        },
+        Some(&origin),
+        |payload| {
+            // One slot per kind: a repeat of one kind never stands in for the other.
+            match payload {
+                RelayPayload::CompactSkeleton(block) if skeleton.is_none() => {
+                    skeleton = Some(block)
+                }
+                RelayPayload::CompactBlock(block) if cached.is_none() => cached = Some(block),
+                _ => {}
+            }
+            skeleton.is_some() && cached.is_some()
+        },
+    )
+    .await;
+    assert!(
+        finished,
+        "within 5 s: skeleton received = {}, cached compact received = {}",
+        skeleton.is_some(),
+        cached.is_some()
+    );
+    assert_eq!(forwarded.mode, ForwardMode::CompactBlock);
+
+    for (kind, block) in [("skeleton", skeleton), ("cached compact", cached)] {
+        let block = block.unwrap();
+        assert_eq!(
+            &block.header[..],
+            &fixture.raw[..ZCASH_FULL_HEADER_SIZE],
+            "{kind}: a different block"
+        );
+        assert_eq!(
+            sovright_relay::consensus_block_hash_display(&block.header),
+            fixture.consensus_hash(),
+            "{kind}"
+        );
+        assert_eq!(
+            block.short_ids.len(),
+            1,
+            "{kind}: v5 transaction as a short ID"
+        );
+
+        let receiver = tx_cache();
+        receiver.insert(fixture.v5_wtxid(), fixture.v5_transaction());
+        match handle_relay_compact_block_with_mempool(
+            &NeverSubmit,
+            &block,
+            SubmitBlockMode::DryRun,
+            &receiver,
+        )
+        .await
+        {
+            Ok(SubmissionOutcome::DryRun(candidate)) => {
+                assert_eq!(
+                    hex::decode(candidate.block_hex).unwrap(),
+                    fixture.raw,
+                    "{kind}"
+                )
+            }
+            other => panic!("{kind}: expected a DryRun candidate, got {other:?}"),
+        }
+
+        // Without the receiver's copy a getblocktxn request is prepared and,
+        // even in live mode, nothing is submitted: NeverSubmit panics if it is.
+        match handle_relay_compact_block_with_mempool(
+            &NeverSubmit,
+            &block,
+            SubmitBlockMode::Live,
+            &tx_cache(),
+        )
+        .await
+        {
+            Ok(SubmissionOutcome::NeedsTransactions { request, .. }) => {
+                assert_eq!(request.indexes, vec![1], "{kind}")
+            }
+            other => panic!("{kind}: expected NeedsTransactions, got {other:?}"),
+        }
+    }
+}
+
+/// Bridge settings the qualification tests vary.
+#[derive(Clone, Copy)]
+struct BridgeMode {
+    compact_from_tx_cache: bool,
+    skeleton_first: bool,
+}
+
 async fn transport(raw: &[u8]) -> CompactBlock {
+    let mut received = None;
+    let (forwarded, finished) = relay_loopback(
+        raw,
+        BridgeMode {
+            compact_from_tx_cache: false,
+            skeleton_first: false,
+        },
+        None,
+        |payload| {
+            if let RelayPayload::CompactBlock(block) = payload {
+                received = Some(block);
+            }
+            received.is_some()
+        },
+    )
+    .await;
+    assert!(finished, "relay delivery timed out");
+    assert_eq!(forwarded.mode, ForwardMode::CompactBlock);
+    received.unwrap()
+}
+
+/// Send `raw` through an authenticated loopback relay and hand each payload
+/// the receiver gets to `take` until it returns true. Returns the bridge's
+/// result and whether `take` finished within 5 s.
+async fn relay_loopback(
+    raw: &[u8],
+    mode: BridgeMode,
+    origin_cache: Option<&TxCache>,
+    mut take: impl FnMut(RelayPayload) -> bool,
+) -> (ForwardedBlock, bool) {
     use sovright_relay::{AuthKey, RelayConfig, RelayNode};
     use tokio::time::{sleep, timeout};
     let key = [0x67; 32]; // Disposable local test key, never a fleet credential.
@@ -59,8 +194,8 @@ async fn transport(raw: &[u8]) -> CompactBlock {
         data_shards: 10,
         parity_shards: 3,
         chunker: Arc::new(BlockChunker::new(10, 3).unwrap()),
-        compact_from_tx_cache: false,
-        skeleton_first: false,
+        compact_from_tx_cache: mode.compact_from_tx_cache,
+        skeleton_first: mode.skeleton_first,
         raw_fallback_with_tx_cache: false,
         raw_segment_send_rounds: 1,
         raw_segment_round_delay: Duration::ZERO,
@@ -82,16 +217,21 @@ async fn transport(raw: &[u8]) -> CompactBlock {
     })
     .await
     .expect("both authenticated sessions must register");
-    let forwarded = bridge.forward_block(raw, None).await.unwrap();
-    assert_eq!(forwarded.mode, ForwardMode::CompactBlock);
-    let received = timeout(Duration::from_secs(5), incoming.recv())
-        .await
-        .expect("relay delivery timed out")
-        .expect("receiver stopped");
+    let forwarded = bridge.forward_block(raw, origin_cache).await.unwrap();
+    let finished = timeout(Duration::from_secs(5), async {
+        while let Some(payload) = incoming.recv_payload().await {
+            if take(payload) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
     assert!(node.metrics().snapshot().packets_received > 0);
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
-    received
+    (forwarded, finished)
 }
 
 /// Explicit operator-only qualification against an isolated testnet node.
