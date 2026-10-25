@@ -255,12 +255,39 @@ where
     Err(last_err.unwrap_or_else(|| "retry_transient: no error captured".into()))
 }
 
-/// True when an error string matches the patterns that production has been
-/// seeing for transient Zebra RPC outages — primarily ConnectionRefused
-/// during GCE disk-snapshot freezes — so we should retry instead of giving
-/// up after a single attempt.
+/// True when an RPC failure is a transient transport error — primarily
+/// ConnectionRefused during GCE disk-snapshot freezes — so we should retry
+/// instead of giving up after a single attempt.
+///
+/// The RPC client's own message does not name the cause: a refused connection
+/// reads `client error (Connect)`, and the `io::Error` that says so is at the
+/// end of the source chain. So every link is checked, by `io::ErrorKind` and by
+/// the text patterns. A JSON-RPC error response anywhere in the chain is the
+/// node's answer, not a transport failure, whatever its message says.
 fn is_transient_transport_error(err: &(dyn std::error::Error + 'static)) -> bool {
-    let text = err.to_string();
+    let chain = || std::iter::successors(Some(err), |e| e.source());
+    if chain().any(|e| {
+        matches!(
+            e.downcast_ref::<jsonrpsee::core::ClientError>(),
+            Some(jsonrpsee::core::ClientError::Call(_))
+        )
+    }) {
+        return false;
+    }
+    chain().any(|e| {
+        e.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::TimedOut
+            )
+        }) || names_transient_error(&e.to_string())
+    })
+}
+
+/// The error text production has been seeing for transient Zebra RPC outages.
+fn names_transient_error(text: &str) -> bool {
     text.contains("ConnectionRefused")
         || text.contains("connection refused")
         || text.contains("Connection reset")
@@ -472,5 +499,138 @@ mod tests {
             1,
             "logical errors must not be retried"
         );
+    }
+
+    /// An error with a message of its own and a cause, the way the RPC client
+    /// wraps the transport failure underneath.
+    #[derive(Debug)]
+    struct Wrapped {
+        message: &'static str,
+        cause: Box<dyn std::error::Error + Send + Sync>,
+    }
+
+    impl std::fmt::Display for Wrapped {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.message)
+        }
+    }
+
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self.cause.as_ref())
+        }
+    }
+
+    /// A client for a loopback port nothing listens on.
+    async fn refused_rpc() -> ZebraRpc {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        ZebraRpc::new(&format!("http://127.0.0.1:{port}"))
+            .await
+            .unwrap()
+    }
+
+    fn call_error(code: i32, message: &'static str) -> jsonrpsee::core::ClientError {
+        jsonrpsee::core::ClientError::Call(jsonrpsee::types::ErrorObjectOwned::owned(
+            code, message, None::<()>,
+        ))
+    }
+
+    /// How many times `retry_transient` runs an operation that always fails
+    /// with `make_error`.
+    async fn attempts_for(
+        make_error: impl Fn() -> Box<dyn std::error::Error + Send + Sync>,
+    ) -> usize {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let result: RpcResult<()> = retry_transient(|| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let error = make_error();
+            async move { Err(error) }
+        })
+        .await;
+        assert!(result.is_err());
+        calls.load(Ordering::SeqCst)
+    }
+
+    /// The client reports a refused connection as `client error (Connect)`;
+    /// the `io::Error` that says so is at the end of the source chain.
+    #[tokio::test]
+    async fn refused_connection_from_the_rpc_client_is_transient() {
+        let error = refused_rpc()
+            .await
+            .get_block_header("00")
+            .await
+            .unwrap_err();
+        assert!(
+            is_transient_transport_error(error.as_ref()),
+            "{error} / {error:?}"
+        );
+    }
+
+    /// Counted by the retried operation itself, not inferred from elapsed time.
+    #[tokio::test]
+    async fn refused_connection_is_attempted_four_times() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let rpc = refused_rpc().await;
+        let calls = AtomicUsize::new(0);
+        let result = retry_transient(|| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            rpc.get_block_header("00")
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "first attempt + 3 retries");
+    }
+
+    #[test]
+    fn io_error_kind_behind_an_outer_message_is_found() {
+        use std::io::{Error, ErrorKind};
+        for (kind, transient) in [
+            (ErrorKind::ConnectionRefused, true),
+            (ErrorKind::ConnectionReset, true),
+            (ErrorKind::TimedOut, true),
+            (ErrorKind::PermissionDenied, false),
+        ] {
+            let error = Wrapped {
+                message: "outer failure",
+                cause: Box::new(Error::from(kind)),
+            };
+            assert_eq!(is_transient_transport_error(&error), transient, "{kind:?}");
+        }
+    }
+
+    /// A JSON-RPC error response is the node's answer. Its text includes the
+    /// node's message, which must not make it look like a transport failure.
+    #[tokio::test]
+    async fn json_rpc_call_errors_are_not_retried() {
+        for (code, message) in [
+            (-32601, "Method not found"),
+            (-32603, "state request timeout"),
+        ] {
+            assert!(
+                !is_transient_transport_error(&call_error(code, message)),
+                "{message}"
+            );
+            assert_eq!(
+                attempts_for(|| Box::new(call_error(code, message))).await,
+                1,
+                "{message}"
+            );
+        }
+    }
+
+    /// The call-error rule holds when another layer wraps the call error, and
+    /// it wins over the text patterns found further down the chain.
+    #[test]
+    fn a_wrapped_json_rpc_call_error_is_still_not_transient() {
+        let error = Wrapped {
+            message: "lookup failed",
+            cause: Box::new(call_error(-32603, "state request timeout")),
+        };
+        assert!(!is_transient_transport_error(&error));
     }
 }
