@@ -28,7 +28,7 @@ use sovright_relay_sidecar::submit::{
     handle_relay_compact_block_with_gate,
 };
 use sovright_relay_sidecar::submit_gate::{
-    CandidateMeta, ChainView, GateConfig, RejectReason, SubmitGate,
+    CandidateMeta, ChainView, GateConfig, ParentObservation, RejectReason, SubmitGate,
 };
 
 // ---------------------------------------------------------------------------
@@ -106,6 +106,16 @@ fn enabled_gate_config() -> GateConfig {
     }
 }
 
+/// A lookup of the header's parent at `height` without best-chain evidence,
+/// so every fixture here faces the polled height window.
+fn looked_up(header: &[u8], height: u64) -> ParentObservation {
+    ParentObservation {
+        parent_hash: CandidateMeta::parent_hash_from_header(header).unwrap(),
+        height,
+        confirmations: None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 1. PoW recheck — mutated candidate hash
 //
@@ -130,6 +140,8 @@ async fn adversarial_header_mutation_rejects_mutated_candidate_hash() {
         height: 101,
         parent_hash: parent,
         block_hash_hex: "different_hash_string".to_string(),
+        observed_tip: None,
+        parent_confirmations: None,
     };
     let chain = ConfigurableChain {
         tip: 100,
@@ -170,7 +182,7 @@ async fn adversarial_unknown_parent_rejects_and_never_submits() {
         &compact,
         SubmitBlockMode::Live,
         &mut gate,
-        99,
+        Some(&looked_up(&compact.header, 99)),
     )
     .await
     .unwrap();
@@ -197,8 +209,8 @@ async fn adversarial_unknown_parent_rejects_and_never_submits() {
 //
 // candidate_height = parent_height + 1. With parent_height = 1000 and tip =
 // 100, the candidate is at height 1001, which is 901 blocks above the
-// permitted upper bound (tip + 1 = 101). The gate must reject with
-// OutOfHeightWindow.
+// permitted upper bound (tip + 1 = 101). Without best-chain evidence for the
+// parent the gate must reject with OutOfHeightWindow.
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn adversarial_far_future_height_rejects() {
@@ -217,7 +229,7 @@ async fn adversarial_far_future_height_rejects() {
         &compact,
         SubmitBlockMode::Live,
         &mut gate,
-        1000,
+        Some(&looked_up(&compact.header, 1000)),
     )
     .await
     .unwrap();
@@ -257,7 +269,7 @@ async fn adversarial_stale_fork_rejects() {
         &compact,
         SubmitBlockMode::Live,
         &mut gate,
-        995,
+        Some(&looked_up(&compact.header, 995)),
     )
     .await
     .unwrap();
@@ -294,7 +306,7 @@ async fn adversarial_dedup_window_rejects_repeat() {
         &compact,
         SubmitBlockMode::DryRun,
         &mut gate,
-        99,
+        Some(&looked_up(&compact.header, 99)),
     )
     .await
     .unwrap();
@@ -305,7 +317,7 @@ async fn adversarial_dedup_window_rejects_repeat() {
         &compact,
         SubmitBlockMode::DryRun,
         &mut gate,
-        99,
+        Some(&looked_up(&compact.header, 99)),
     )
     .await
     .unwrap();
@@ -322,8 +334,9 @@ async fn adversarial_dedup_window_rejects_repeat() {
 // ---------------------------------------------------------------------------
 // 6. Parent height overflow
 //
-// CandidateMeta::from_header_bytes returns None when parent_height = u64::MAX
-// because the candidate height (parent + 1) would overflow. The wrapper
+// CandidateMeta::from_header_bytes returns ParentHeightOverflow when the
+// observed parent height is u64::MAX, because the candidate height (parent +
+// 1) would overflow. The wrapper
 // surfaces this as a ReconstructionInvalid error so the staging service can
 // log + count without thinking it's a successful submission.
 // ---------------------------------------------------------------------------
@@ -343,7 +356,7 @@ async fn adversarial_parent_height_max_returns_reconstruction_invalid() {
         &compact,
         SubmitBlockMode::DryRun,
         &mut gate,
-        u64::MAX,
+        Some(&looked_up(&compact.header, u64::MAX)),
     )
     .await;
 
@@ -385,7 +398,7 @@ async fn adversarial_disabled_gate_accepts_unknown_parent() {
         &compact,
         SubmitBlockMode::DryRun,
         &mut gate,
-        99,
+        Some(&looked_up(&compact.header, 99)),
     )
     .await
     .unwrap();

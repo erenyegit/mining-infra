@@ -20,12 +20,34 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::rpc::ZebraRpc;
-use crate::submit_gate::ChainView;
+use crate::submit_gate::{CandidateMeta, ChainView, ParentObservation};
 
 /// Type alias for the underlying RPC failure surface. The poller logs and
 /// continues; the gate sees a stale tip during a transient outage rather
 /// than a panic.
 type RpcResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// `getblockheader` answered for a different block than the one queried, so
+/// the response says nothing about the queried parent.
+#[derive(Debug)]
+pub struct ParentHashMismatch {
+    /// Display-order hash that was queried.
+    pub queried: String,
+    /// Display-order hash in the response.
+    pub returned: String,
+}
+
+impl std::fmt::Display for ParentHashMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "getblockheader returned block {} for query {}",
+            self.returned, self.queried
+        )
+    }
+}
+
+impl std::error::Error for ParentHashMismatch {}
 
 /// Cached chain state shared between the polling task and `ChainView` callers.
 ///
@@ -173,21 +195,70 @@ impl ZebraChainView {
         Ok(known)
     }
 
-    /// Look up the height of a block hash via the local Zebra. Used by the
-    /// gated submit handler to fill `CandidateMeta.height = parent_height + 1`.
+    /// Look up a parent block via the local Zebra, for the gated submit
+    /// handlers: its height (the candidate is at height + 1) and whether the
+    /// node placed it on its best chain.
     ///
-    /// On a successful lookup, the hash is also admitted to the parent-known
-    /// cache as a side effect — the height query proves the hash exists, so
-    /// the next `parent_known` for the same hash short-circuits.
-    pub async fn height_of(&self, rpc: &ZebraRpc, hash: &[u8; 32]) -> RpcResult<Option<u64>> {
+    /// The response must be for the queried hash; otherwise this returns
+    /// `ParentHashMismatch` and the hash is not cached. On a matching
+    /// response the hash is admitted to the parent-known cache as a side
+    /// effect, so the next `parent_known` for it short-circuits. `Ok(None)`
+    /// means the node does not know the hash.
+    pub async fn observe_parent(
+        &self,
+        rpc: &ZebraRpc,
+        hash: &[u8; 32],
+    ) -> RpcResult<Option<ParentObservation>> {
         let hex_hash = display_hex_encode(hash);
-        match self.get_block_header_with_retry(rpc, &hex_hash).await? {
-            Some(info) => {
-                self.admit_parent(*hash);
-                Ok(Some(info.height))
-            }
-            None => Ok(None),
+        let Some(info) = self.get_block_header_with_retry(rpc, &hex_hash).await? else {
+            return Ok(None);
+        };
+        if !info.hash.eq_ignore_ascii_case(&hex_hash) {
+            return Err(Box::new(ParentHashMismatch {
+                queried: hex_hash,
+                returned: info.hash,
+            }));
         }
+        self.admit_parent(*hash);
+        Ok(Some(ParentObservation {
+            parent_hash: *hash,
+            height: info.height,
+            confirmations: info.confirmations,
+        }))
+    }
+
+    /// Observe the parent named in a candidate's header. Any failure leaves
+    /// the candidate without an observation, which the gate rejects as
+    /// before; a response for another block and a failed lookup are logged
+    /// separately.
+    pub async fn observe_candidate_parent(
+        &self,
+        rpc: &ZebraRpc,
+        header: &[u8],
+    ) -> Option<ParentObservation> {
+        let parent_hash = CandidateMeta::parent_hash_from_header(header)?;
+        let observation = self.observe_parent(rpc, &parent_hash).await;
+        let Err(error) = observation else {
+            return observation.ok().flatten();
+        };
+        // The candidate's consensus hash, from the header at the start of the
+        // compact header or raw block.
+        let candidate = header
+            .get(..sovright_relay::ZCASH_FULL_HEADER_SIZE)
+            .map(sovright_relay::consensus_block_hash_display)
+            .unwrap_or_else(|| "short-header".to_owned());
+        let parent = display_hex_encode(&parent_hash);
+        if error.is::<ParentHashMismatch>() {
+            tracing::warn!(
+                %error,
+                %parent,
+                %candidate,
+                "ZebraChainView: parent lookup answered for another block"
+            );
+        } else {
+            tracing::warn!(%error, %parent, %candidate, "ZebraChainView: parent lookup failed");
+        }
+        None
     }
 
     /// Call `rpc.get_block_header(...)` with bounded retry on transient
@@ -430,6 +501,26 @@ mod tests {
         let out = hex_encode(&bytes);
         assert_eq!(&out[..8], "009aff10");
         assert_eq!(out.len(), 64);
+    }
+
+    /// Zebra is queried with the parent's consensus hash (double-SHA256) in
+    /// display order. Mainnet block 3470793's header must reproduce Zebra's
+    /// own display hash for it; the relay's BLAKE2b object id must not.
+    #[test]
+    fn zebra_query_uses_the_consensus_hash_in_display_order() {
+        use zcash_pool_common::fixtures::{
+            MAINNET_BLOCK_3470793_HASH_DISPLAY, mainnet_serialized_header,
+        };
+        let header = mainnet_serialized_header();
+        assert_eq!(
+            display_hex_encode(&sovright_relay::consensus_block_hash(&header)),
+            MAINNET_BLOCK_3470793_HASH_DISPLAY,
+        );
+        assert_ne!(
+            display_hex_encode(&sovright_relay::zcash_block_hash(&header)),
+            MAINNET_BLOCK_3470793_HASH_DISPLAY,
+            "the relay object id is not Zebra's block hash",
+        );
     }
 
     #[test]

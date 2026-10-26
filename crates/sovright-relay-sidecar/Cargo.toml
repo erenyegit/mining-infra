@@ -32,4 +32,6 @@ jsonrpsee = { version = "0.24", features = ["http-client"] }
 
 [dev-dependencies]
 zcash-pool-common = { path = "../zcash-pool-common", features = ["test-support"] }
+# Local JSON-RPC server standing in for Zebra in the gate tests.
+jsonrpsee = { version = "0.24", features = ["server"] }
 tempfile = "3"

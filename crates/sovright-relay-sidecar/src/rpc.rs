@@ -112,6 +112,11 @@ pub struct BlockHeaderInfo {
     #[serde(rename = "previousblockhash")]
     #[serde(default)]
     pub previous_block_hash: Option<String>,
+    /// `depth + 1` while the block is on the node's best chain, `-1` when it
+    /// is not (Zebra `get_block_header`, `zebra-rpc/src/methods.rs`). `None`
+    /// from a node that does not report it.
+    #[serde(default)]
+    pub confirmations: Option<i64>,
 }
 
 /// Subset of verbose `getrawtransaction` used by the mempool-sync task. Extra
@@ -320,5 +325,38 @@ mod tests {
         let info: BlockHeaderInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.height, 0);
         assert_eq!(info.previous_block_hash, None);
+    }
+
+    #[test]
+    fn block_header_info_reads_confirmations() {
+        // Zebra's verbose shape; the fields we do not read are ignored.
+        let response = |confirmations: &str| {
+            format!(
+                r#"{{
+                    "hash": "000000000030976123e65211bdfb288b21b4492f56bb1a42710588ca6b8c0d98",
+                    {confirmations}
+                    "height": 3470793,
+                    "version": 4,
+                    "merkleroot": "00",
+                    "blockcommitments": "00",
+                    "finalsaplingroot": "00",
+                    "time": 1761000000,
+                    "nonce": "00",
+                    "solution": "00",
+                    "bits": "1c0168fd",
+                    "difficulty": 1.0,
+                    "previousblockhash": "00000000001380045e6c366dfe888cd5085a20660e4524f59dd813c4f05a5707"
+                }}"#
+            )
+        };
+        for (field, expected) in [
+            (r#""confirmations": 1,"#, Some(1)),
+            (r#""confirmations": -1,"#, Some(-1)),
+            ("", None),
+        ] {
+            let info: BlockHeaderInfo = serde_json::from_str(&response(field)).unwrap();
+            assert_eq!(info.confirmations, expected, "{field:?}");
+            assert_eq!(info.height, 3470793);
+        }
     }
 }

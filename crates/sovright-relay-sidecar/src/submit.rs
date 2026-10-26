@@ -544,12 +544,15 @@ pub async fn handle_relay_raw_block<S: SubmitBlock + Sync>(
 /// mode also short-circuits with `GateRejected`. That lets the staging service
 /// exercise the gate's decision logic on every candidate without ever calling
 /// `submit_block`.
+///
+/// `parent` is the lookup of the header's parent
+/// (`ZebraChainView::observe_candidate_parent`), `None` if it failed.
 pub async fn handle_relay_compact_block_with_gate<S, V>(
     submitter: &S,
     compact: &CompactBlock,
     mode: SubmitBlockMode,
     gate: &mut crate::submit_gate::SubmitGate<V>,
-    parent_height: u64,
+    parent: Option<&crate::submit_gate::ParentObservation>,
 ) -> Result<SubmissionOutcome, RelayBlockError>
 where
     S: SubmitBlock + Sync,
@@ -559,12 +562,9 @@ where
     let meta = crate::submit_gate::CandidateMeta::from_header_bytes(
         &compact.header,
         candidate.block_hash.clone(),
-        parent_height,
+        parent,
     )
-    .ok_or_else(|| RelayBlockError::ReconstructionInvalid {
-        reason: "candidate meta extraction failed: header too short or parent height overflow"
-            .to_owned(),
-    })?;
+    .map_err(candidate_meta_error)?;
 
     match gate.apply_now(&candidate, &meta) {
         crate::submit_gate::GateDecision::Accept => {}
@@ -590,13 +590,16 @@ where
 
 /// Handle one relay raw block, evaluating the safety gate against the
 /// reassembled candidate before any submit_block call.
+///
+/// `parent` is the lookup of the header's parent
+/// (`ZebraChainView::observe_candidate_parent`), `None` if it failed.
 pub async fn handle_relay_raw_block_with_gate<S, V>(
     submitter: &S,
     raw_block: &[u8],
     expected_block_hash: Option<[u8; 32]>,
     mode: SubmitBlockMode,
     gate: &mut crate::submit_gate::SubmitGate<V>,
-    parent_height: u64,
+    parent: Option<&crate::submit_gate::ParentObservation>,
 ) -> Result<SubmissionOutcome, RelayBlockError>
 where
     S: SubmitBlock + Sync,
@@ -617,12 +620,9 @@ where
     let meta = crate::submit_gate::CandidateMeta::from_header_bytes(
         header,
         candidate.block_hash.clone(),
-        parent_height,
+        parent,
     )
-    .ok_or_else(|| RelayBlockError::ReconstructionInvalid {
-        reason: "candidate meta extraction failed: header too short or parent height overflow"
-            .to_owned(),
-    })?;
+    .map_err(candidate_meta_error)?;
 
     match gate.apply_now(&candidate, &meta) {
         crate::submit_gate::GateDecision::Accept => {}
@@ -643,6 +643,14 @@ where
                     .await?;
             Ok(SubmissionOutcome::Submitted { candidate, status })
         }
+    }
+}
+
+/// A gated candidate whose `CandidateMeta` could not be built never reaches
+/// the gate or `submit_block`; each cause keeps its own reason text.
+fn candidate_meta_error(error: crate::submit_gate::CandidateMetaError) -> RelayBlockError {
+    RelayBlockError::ReconstructionInvalid {
+        reason: format!("candidate meta extraction failed: {}", error.as_str()),
     }
 }
 

@@ -250,7 +250,9 @@ async fn dry_run_raw_block_does_not_submit_to_zebra() {
 use sovright_relay_sidecar::submit::{
     handle_relay_compact_block_with_gate, handle_relay_raw_block_with_gate,
 };
-use sovright_relay_sidecar::submit_gate::{ChainView, GateConfig, RejectReason, SubmitGate};
+use sovright_relay_sidecar::submit_gate::{
+    CandidateMeta, ChainView, GateConfig, ParentObservation, RejectReason, SubmitGate,
+};
 
 struct AlwaysKnownChain {
     tip: u64,
@@ -299,6 +301,16 @@ fn enabled_gate_config() -> GateConfig {
     }
 }
 
+/// A lookup of the header's parent at `height` that did not report it on the
+/// best chain, so the gate applies its polled height window unchanged.
+fn looked_up(header: &[u8], height: u64) -> ParentObservation {
+    ParentObservation {
+        parent_hash: CandidateMeta::parent_hash_from_header(header).unwrap(),
+        height,
+        confirmations: None,
+    }
+}
+
 #[tokio::test]
 async fn gated_compact_dry_run_accepts_when_gate_accepts() {
     let submitter = CountingSubmitter::new();
@@ -315,7 +327,7 @@ async fn gated_compact_dry_run_accepts_when_gate_accepts() {
         &compact,
         SubmitBlockMode::DryRun,
         &mut gate,
-        parent_height,
+        Some(&looked_up(&compact.header, parent_height)),
     )
     .await
     .unwrap();
@@ -340,7 +352,7 @@ async fn gated_compact_rejects_unknown_parent() {
         &compact,
         SubmitBlockMode::Live,
         &mut gate,
-        99,
+        Some(&looked_up(&compact.header, 99)),
     )
     .await
     .unwrap();
@@ -376,7 +388,7 @@ async fn gated_compact_rejects_out_of_window_height() {
         &compact,
         SubmitBlockMode::Live,
         &mut gate,
-        995,
+        Some(&looked_up(&compact.header, 995)),
     )
     .await
     .unwrap();
@@ -403,7 +415,7 @@ async fn gated_compact_dedups_repeat_submissions() {
         &compact,
         SubmitBlockMode::DryRun,
         &mut gate,
-        99,
+        Some(&looked_up(&compact.header, 99)),
     )
     .await
     .unwrap();
@@ -414,7 +426,7 @@ async fn gated_compact_dedups_repeat_submissions() {
         &compact,
         SubmitBlockMode::DryRun,
         &mut gate,
-        99,
+        Some(&looked_up(&compact.header, 99)),
     )
     .await
     .unwrap();
@@ -445,7 +457,7 @@ async fn gated_compact_disabled_gate_accepts() {
         &compact,
         SubmitBlockMode::DryRun,
         &mut gate,
-        99,
+        Some(&looked_up(&compact.header, 99)),
     )
     .await
     .unwrap();
@@ -466,11 +478,74 @@ async fn gated_raw_block_dry_run_accepts_when_gate_accepts() {
         Some(expected_hash),
         SubmitBlockMode::DryRun,
         &mut gate,
-        99,
+        Some(&looked_up(&raw, 99)),
     )
     .await
     .unwrap();
     assert!(matches!(outcome, SubmissionOutcome::DryRun(_)));
+    assert_eq!(submitter.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn gated_compact_refuses_observation_for_another_parent() {
+    let submitter = CountingSubmitter::new();
+    let compact = compact_with_prefilled_one();
+    let chain = AlwaysKnownChain { tip: 100 };
+    let mut gate = SubmitGate::new(enabled_gate_config(), chain);
+    // On the best chain, but for a parent the header does not name.
+    let other = ParentObservation {
+        parent_hash: [0x5a; 32],
+        height: 100,
+        confirmations: Some(1),
+    };
+
+    let result = handle_relay_compact_block_with_gate(
+        &submitter,
+        &compact,
+        SubmitBlockMode::Live,
+        &mut gate,
+        Some(&other),
+    )
+    .await;
+
+    match result {
+        Err(RelayBlockError::ReconstructionInvalid { reason }) => assert_eq!(
+            reason,
+            "candidate meta extraction failed: parent observation is for a different parent"
+        ),
+        other => panic!("expected ReconstructionInvalid, got {other:?}"),
+    }
+    assert_eq!(submitter.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn gated_compact_refuses_an_observed_tip_that_overflows() {
+    let submitter = CountingSubmitter::new();
+    let compact = compact_with_prefilled_one();
+    let chain = AlwaysKnownChain { tip: 100 };
+    let mut gate = SubmitGate::new(enabled_gate_config(), chain);
+    // parent height + confirmations - 1 does not fit in a u64.
+    let overflowing = ParentObservation {
+        confirmations: Some(3),
+        ..looked_up(&compact.header, u64::MAX - 1)
+    };
+
+    let result = handle_relay_compact_block_with_gate(
+        &submitter,
+        &compact,
+        SubmitBlockMode::Live,
+        &mut gate,
+        Some(&overflowing),
+    )
+    .await;
+
+    match result {
+        Err(RelayBlockError::ReconstructionInvalid { reason }) => assert_eq!(
+            reason,
+            "candidate meta extraction failed: observed tip overflow"
+        ),
+        other => panic!("expected ReconstructionInvalid, got {other:?}"),
+    }
     assert_eq!(submitter.calls.load(Ordering::SeqCst), 0);
 }
 
