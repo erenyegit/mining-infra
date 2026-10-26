@@ -237,17 +237,28 @@ impl ZebraChainView {
         header: &[u8],
     ) -> Option<ParentObservation> {
         let parent_hash = CandidateMeta::parent_hash_from_header(header)?;
-        match self.observe_parent(rpc, &parent_hash).await {
-            Ok(observation) => observation,
-            Err(error) if error.is::<ParentHashMismatch>() => {
-                tracing::warn!(%error, "ZebraChainView: parent lookup answered for another block");
-                None
-            }
-            Err(error) => {
-                tracing::warn!(%error, "ZebraChainView: parent lookup failed");
-                None
-            }
+        let observation = self.observe_parent(rpc, &parent_hash).await;
+        let Err(error) = observation else {
+            return observation.ok().flatten();
+        };
+        // The candidate's consensus hash, from the header at the start of the
+        // compact header or raw block.
+        let candidate = header
+            .get(..sovright_relay::ZCASH_FULL_HEADER_SIZE)
+            .map(sovright_relay::consensus_block_hash_display)
+            .unwrap_or_else(|| "short-header".to_owned());
+        let parent = display_hex_encode(&parent_hash);
+        if error.is::<ParentHashMismatch>() {
+            tracing::warn!(
+                %error,
+                %parent,
+                %candidate,
+                "ZebraChainView: parent lookup answered for another block"
+            );
+        } else {
+            tracing::warn!(%error, %parent, %candidate, "ZebraChainView: parent lookup failed");
         }
+        None
     }
 
     /// Call `rpc.get_block_header(...)` with bounded retry on transient

@@ -545,3 +545,60 @@ async fn refused_connection_is_rejected_and_not_cached() {
     assert!(!view.parent_known(&parent_hash()));
     assert_eq!(events.count("ZebraChainView: parent lookup failed"), 1);
 }
+
+// ---------------------------------------------------------------------------
+// The window follows Zebra's tip at the lookup, not just the polled one
+// ---------------------------------------------------------------------------
+
+/// Run the compact child against a parent Zebra reports with `confirmations`,
+/// while the polled tip is one below the parent.
+async fn compact_with_parent_confirmations(
+    confirmations: i64,
+) -> (SubmissionOutcome, usize, CapturedEvents) {
+    let (events, _guard) = capture();
+    let (_zebra, rpc, _server) = start_mock_zebra(HeaderReply::Result(header_result(
+        MAINNET_BLOCK_3470793_HASH_DISPLAY,
+        Some(confirmations),
+    )))
+    .await;
+    let view = stale_view();
+    let mut gate = gate_over(&view);
+    let submitter = CountingSubmitter::new();
+    let outcome = run_compact(&rpc, &view, &mut gate, &submitter).await;
+    (outcome, submitter.calls(), events)
+}
+
+/// Zebra is 100 blocks past the parent: the child is a deep fork block. The
+/// window against Zebra's tip (parent + 101 - 1) is [3_470_890, 3_470_894].
+#[tokio::test]
+async fn deep_fork_child_is_rejected_against_zebras_tip() {
+    let (outcome, calls, events) = compact_with_parent_confirmations(101).await;
+
+    assert_rejected(&outcome, RejectReason::OutOfHeightWindow);
+    assert_eq!(calls, 0);
+    assert_eq!(events.count(EVIDENCE_LOG), 0);
+}
+
+/// Confirmations 5 put Zebra's tip at parent + 4, so the child sits exactly
+/// on the lower bound (tip - 3).
+#[tokio::test]
+async fn child_at_the_observed_lower_bound_is_submitted() {
+    let (outcome, calls, events) = compact_with_parent_confirmations(5).await;
+
+    assert!(
+        matches!(outcome, SubmissionOutcome::Submitted { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(calls, 1);
+    assert_eq!(events.count(EVIDENCE_LOG), 1);
+}
+
+/// Confirmations 6: the lower bound is one above the child.
+#[tokio::test]
+async fn child_one_below_the_observed_lower_bound_is_rejected() {
+    let (outcome, calls, events) = compact_with_parent_confirmations(6).await;
+
+    assert_rejected(&outcome, RejectReason::OutOfHeightWindow);
+    assert_eq!(calls, 0);
+    assert_eq!(events.count(EVIDENCE_LOG), 0);
+}

@@ -518,6 +518,37 @@ async fn gated_compact_refuses_observation_for_another_parent() {
     assert_eq!(submitter.calls.load(Ordering::SeqCst), 0);
 }
 
+#[tokio::test]
+async fn gated_compact_refuses_an_observed_tip_that_overflows() {
+    let submitter = CountingSubmitter::new();
+    let compact = compact_with_prefilled_one();
+    let chain = AlwaysKnownChain { tip: 100 };
+    let mut gate = SubmitGate::new(enabled_gate_config(), chain);
+    // parent height + confirmations - 1 does not fit in a u64.
+    let overflowing = ParentObservation {
+        confirmations: Some(3),
+        ..looked_up(&compact.header, u64::MAX - 1)
+    };
+
+    let result = handle_relay_compact_block_with_gate(
+        &submitter,
+        &compact,
+        SubmitBlockMode::Live,
+        &mut gate,
+        Some(&overflowing),
+    )
+    .await;
+
+    match result {
+        Err(RelayBlockError::ReconstructionInvalid { reason }) => assert_eq!(
+            reason,
+            "candidate meta extraction failed: observed tip overflow"
+        ),
+        other => panic!("expected ReconstructionInvalid, got {other:?}"),
+    }
+    assert_eq!(submitter.calls.load(Ordering::SeqCst), 0);
+}
+
 // --- rejection classification ---------------------------------------------
 //
 // In a four-relay mesh every sidecar races to submit the same block and the

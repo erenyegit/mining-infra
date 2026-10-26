@@ -33,9 +33,9 @@
 //! - **Height window** — confirm the block height is within
 //!   `tip - allowed_below ..= tip + 1`. Submitting an old reorg attempt or a
 //!   far-future block is wasteful and noisy. `tip` is polled and can lag the
-//!   node, so the upper bound is not applied to a candidate whose own parent
-//!   lookup placed the parent on the node's best chain (see
-//!   [`CandidateMeta::parent_on_best_chain`]).
+//!   node, so when the candidate's own parent lookup reports the node's tip
+//!   (see [`CandidateMeta::observed_tip`]), the window uses the higher of the
+//!   two.
 //! - **Hash dedup** — confirm we have not already submitted this exact block
 //!   hash within the dedup window. Two reassembly paths can produce the same
 //!   block in close succession; the first wins.
@@ -212,16 +212,17 @@ impl<V: ChainView> SubmitGate<V> {
         }
 
         // (3) Height window. The tip is polled and can lag behind the node,
-        //     for longer while the poll's RPC is failing. A candidate whose
-        //     parent lookup placed the parent on the node's best chain is at
-        //     most one above the node's tip at that lookup, so the polled
-        //     upper bound does not apply to it. The lower bound always uses
-        //     the polled tip.
-        let tip = self.chain.tip_height();
+        //     for longer while the poll's RPC is failing. When the candidate's
+        //     parent lookup reported the node's tip at that read, both bounds
+        //     use the higher of the two; a polled tip that is higher (say,
+        //     stale after a reorg that lowered the height) keeps its window.
+        let polled_tip = self.chain.tip_height();
+        let tip = meta
+            .observed_tip
+            .map_or(polled_tip, |observed| observed.max(polled_tip));
         let lower = tip.saturating_sub(self.config.allowed_below);
         let upper = tip.saturating_add(1);
-        let above_polled_tip = meta.height > upper;
-        if meta.height < lower || (above_polled_tip && !meta.parent_on_best_chain) {
+        if meta.height < lower || meta.height > upper {
             return GateDecision::Reject(RejectReason::OutOfHeightWindow);
         }
 
@@ -232,12 +233,14 @@ impl<V: ChainView> SubmitGate<V> {
         self.dedup.record(candidate.block_hash.clone(), now);
 
         // Only accepted candidates are logged, so each line is a block the
-        // polled upper bound alone would have rejected.
-        if above_polled_tip {
+        // polled window alone would have rejected.
+        if meta.height > polled_tip.saturating_add(1) {
             tracing::info!(
                 consensus_block_hash = %candidate.consensus_block_hash,
                 height = meta.height,
-                polled_tip = tip,
+                polled_tip,
+                observed_tip = ?meta.observed_tip,
+                parent_confirmations = ?meta.parent_confirmations,
                 "submit gate: upper bound passed on parent best-chain evidence"
             );
         }
@@ -260,18 +263,21 @@ pub struct CandidateMeta {
     /// candidate is constructed. Tracked separately so the gate can detect
     /// mutation.
     pub block_hash_hex: String,
-    /// The candidate's own parent lookup reported the parent on the node's
-    /// best chain (`confirmations >= 1`). The candidate is then at most one
-    /// above the node's tip at that lookup, so the gate does not hold it to
-    /// the polled upper bound. It does not relax the lower bound.
-    pub parent_on_best_chain: bool,
+    /// The node's tip at the candidate's own parent lookup:
+    /// `parent height + confirmations - 1`, when that lookup placed the parent
+    /// on the node's best chain (`confirmations >= 1`). `None` otherwise. The
+    /// gate's window uses the higher of this and the polled tip.
+    pub observed_tip: Option<u64>,
+    /// `confirmations` from the same lookup, kept for the gate's log.
+    pub parent_confirmations: Option<i64>,
 }
 
 /// What the local node reported about a candidate's parent, from the
 /// `getblockheader` lookup made for that candidate.
 ///
-/// Production code gets one only from `ZebraChainView::observe_parent`, which
-/// has already checked that the response is for `parent_hash`.
+/// By convention production code gets one only from
+/// `ZebraChainView::observe_parent`, which has already checked that the
+/// response is for `parent_hash`; the fields are public so tests can build one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParentObservation {
     /// The parent hash that was queried, in header byte order.
@@ -283,13 +289,6 @@ pub struct ParentObservation {
     pub confirmations: Option<i64>,
 }
 
-impl ParentObservation {
-    /// True when the response placed the parent on the node's best chain.
-    pub fn on_best_chain(&self) -> bool {
-        matches!(self.confirmations, Some(confirmations) if confirmations >= 1)
-    }
-}
-
 /// Why a `CandidateMeta` could not be built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CandidateMetaError {
@@ -299,6 +298,9 @@ pub enum CandidateMetaError {
     ParentHeightOverflow,
     /// The observation was made for a different parent than the header's.
     ObservationForOtherParent,
+    /// `parent height + confirmations - 1` does not fit: the lookup cannot be
+    /// turned into a tip, and the polled tip is not a safe stand-in for it.
+    ObservedTipOverflow,
 }
 
 impl CandidateMetaError {
@@ -309,6 +311,7 @@ impl CandidateMetaError {
             CandidateMetaError::ObservationForOtherParent => {
                 "parent observation is for a different parent"
             }
+            CandidateMetaError::ObservedTipOverflow => "observed tip overflow",
         }
     }
 }
@@ -348,6 +351,9 @@ impl CandidateMeta {
     /// The candidate height is the observed parent height + 1. Without an
     /// observation (the lookup failed or the parent is unknown) the parent
     /// height is taken as 0, as before, so the gate rejects the candidate.
+    /// The observed tip comes from the same observation, and only when it
+    /// placed the parent on the best chain; missing, zero or negative
+    /// confirmations leave the gate on the polled tip.
     pub fn from_header_bytes(
         header: &[u8],
         block_hash_hex: String,
@@ -355,21 +361,32 @@ impl CandidateMeta {
     ) -> Result<Self, CandidateMetaError> {
         let parent_hash =
             Self::parent_hash_from_header(header).ok_or(CandidateMetaError::HeaderTooShort)?;
-        let (parent_height, parent_on_best_chain) = match parent {
+        let (parent_height, parent_confirmations) = match parent {
             Some(observed) if observed.parent_hash != parent_hash => {
                 return Err(CandidateMetaError::ObservationForOtherParent);
             }
-            Some(observed) => (observed.height, observed.on_best_chain()),
-            None => (0, false),
+            Some(observed) => (observed.height, observed.confirmations),
+            None => (0, None),
+        };
+        // Candidate height is parent height + 1, the standard linkage.
+        let height = parent_height
+            .checked_add(1)
+            .ok_or(CandidateMetaError::ParentHeightOverflow)?;
+        let observed_tip = match parent_confirmations {
+            Some(confirmations) if confirmations >= 1 => Some(
+                u64::try_from(confirmations - 1)
+                    .ok()
+                    .and_then(|depth| parent_height.checked_add(depth))
+                    .ok_or(CandidateMetaError::ObservedTipOverflow)?,
+            ),
+            _ => None,
         };
         Ok(Self {
-            // Candidate height is parent height + 1, the standard linkage.
-            height: parent_height
-                .checked_add(1)
-                .ok_or(CandidateMetaError::ParentHeightOverflow)?,
+            height,
             parent_hash,
             block_hash_hex,
-            parent_on_best_chain,
+            observed_tip,
+            parent_confirmations,
         })
     }
 }
@@ -407,14 +424,8 @@ mod tests {
             height,
             parent_hash: parent,
             block_hash_hex: hash.to_string(),
-            parent_on_best_chain: false,
-        }
-    }
-
-    fn meta_with_best_chain_parent(height: u64, parent: [u8; 32], hash: &str) -> CandidateMeta {
-        CandidateMeta {
-            parent_on_best_chain: true,
-            ..meta(height, parent, hash)
+            observed_tip: None,
+            parent_confirmations: None,
         }
     }
 
@@ -430,6 +441,22 @@ mod tests {
             height,
             confirmations,
         }
+    }
+
+    /// A candidate at `height` whose parent lookup reported `confirmations`,
+    /// built the way production builds it.
+    fn meta_with_parent_confirmations(
+        height: u64,
+        parent: [u8; 32],
+        hash: &str,
+        confirmations: i64,
+    ) -> CandidateMeta {
+        CandidateMeta::from_header_bytes(
+            &header_with_parent(parent),
+            hash.to_string(),
+            Some(&observed(parent, height - 1, Some(confirmations))),
+        )
+        .unwrap()
     }
 
     fn chain(tip: u64, parents: Vec<[u8; 32]>) -> ChainStub {
@@ -519,14 +546,14 @@ mod tests {
     }
 
     /// The polled tip still says 1000 after the node accepted 1001; the next
-    /// block, 1002, has a parent the node reported on its best chain.
+    /// block, 1002, has a parent the node reported at its tip.
     #[test]
     fn stale_polled_tip_accepts_next_block_with_best_chain_parent() {
         let parent = [7u8; 32];
         let mut g = SubmitGate::new(enabled_config(), chain(1000, vec![parent]));
         let c = candidate("1a");
         assert_eq!(
-            g.apply_now(&c, &meta_with_best_chain_parent(1002, parent, "1a")),
+            g.apply_now(&c, &meta_with_parent_confirmations(1002, parent, "1a", 1)),
             GateDecision::Accept,
         );
     }
@@ -542,15 +569,68 @@ mod tests {
         );
     }
 
+    /// The polled tip is stuck at 1000 while Zebra is at 1200: a parent at
+    /// 1100 with 101 confirmations makes 1101 a 100-deep fork child. Against
+    /// Zebra's tip the window is [1197, 1201].
+    #[test]
+    fn deep_fork_child_is_rejected_against_the_observed_tip() {
+        let parent = [7u8; 32];
+        let mut g = SubmitGate::new(enabled_config(), chain(1000, vec![parent]));
+        let c = candidate("2a");
+        assert_eq!(
+            g.apply_now(&c, &meta_with_parent_confirmations(1101, parent, "2a", 101)),
+            GateDecision::Reject(RejectReason::OutOfHeightWindow),
+        );
+    }
+
+    /// Confirmations 5 put the observed tip at 1104: the window is
+    /// [1101, 1105] and 1101 sits on its lower bound.
+    #[test]
+    fn candidate_at_the_observed_lower_bound_is_accepted() {
+        let parent = [7u8; 32];
+        let mut g = SubmitGate::new(enabled_config(), chain(1000, vec![parent]));
+        let c = candidate("2b");
+        assert_eq!(
+            g.apply_now(&c, &meta_with_parent_confirmations(1101, parent, "2b", 5)),
+            GateDecision::Accept,
+        );
+    }
+
+    /// Confirmations 6: the window is [1102, 1106], one above 1101.
+    #[test]
+    fn candidate_one_below_the_observed_lower_bound_is_rejected() {
+        let parent = [7u8; 32];
+        let mut g = SubmitGate::new(enabled_config(), chain(1000, vec![parent]));
+        let c = candidate("2c");
+        assert_eq!(
+            g.apply_now(&c, &meta_with_parent_confirmations(1101, parent, "2c", 6)),
+            GateDecision::Reject(RejectReason::OutOfHeightWindow),
+        );
+    }
+
     #[test]
     fn best_chain_evidence_does_not_relax_lower_bound() {
         let parent = [7u8; 32];
         let mut g = SubmitGate::new(enabled_config(), chain(1000, vec![parent]));
         let c = candidate("1c");
-        // Parent 990 on the best chain (confirmations 11): candidate 991 is
-        // below the window [997, 1001].
+        // Parent 990 with confirmations 11: the observed tip is 1000, and
+        // candidate 991 is below the window [997, 1001].
         assert_eq!(
-            g.apply_now(&c, &meta_with_best_chain_parent(991, parent, "1c")),
+            g.apply_now(&c, &meta_with_parent_confirmations(991, parent, "1c", 11)),
+            GateDecision::Reject(RejectReason::OutOfHeightWindow),
+        );
+    }
+
+    /// The polled tip (1000) is above the observed tip (995), as after a reorg
+    /// that lowered the height. The higher, polled tip keeps the window, so
+    /// 996 is rejected as before; this is a known limit.
+    #[test]
+    fn higher_polled_tip_keeps_its_window() {
+        let parent = [7u8; 32];
+        let mut g = SubmitGate::new(enabled_config(), chain(1000, vec![parent]));
+        let c = candidate("2d");
+        assert_eq!(
+            g.apply_now(&c, &meta_with_parent_confirmations(996, parent, "2d", 1)),
             GateDecision::Reject(RejectReason::OutOfHeightWindow),
         );
     }
@@ -624,7 +704,8 @@ mod tests {
         assert_eq!(meta.parent_hash[0], 1);
         assert_eq!(meta.parent_hash[31], 32);
         assert_eq!(meta.block_hash_hex, "abc");
-        assert!(meta.parent_on_best_chain);
+        assert_eq!(meta.observed_tip, Some(100));
+        assert_eq!(meta.parent_confirmations, Some(1));
     }
 
     #[test]
@@ -632,7 +713,7 @@ mod tests {
         let header = header_with_parent([5u8; 32]);
         let meta = CandidateMeta::from_header_bytes(&header, "ab".into(), None).unwrap();
         assert_eq!(meta.height, 1);
-        assert!(!meta.parent_on_best_chain);
+        assert_eq!(meta.observed_tip, None);
     }
 
     #[test]
@@ -672,22 +753,42 @@ mod tests {
         );
     }
 
+    /// Only a lookup that placed the parent on the best chain gives a tip;
+    /// anything else leaves the gate on the polled tip.
     #[test]
-    fn only_positive_confirmations_place_parent_on_best_chain() {
+    fn only_positive_confirmations_give_an_observed_tip() {
         let parent = [5u8; 32];
         for (confirmations, expected) in [
-            (Some(1), true),
-            (Some(11), true),
-            (Some(0), false),
-            (Some(-1), false),
-            (None, false),
+            (Some(1), Some(100)),
+            (Some(11), Some(110)),
+            (Some(0), None),
+            (Some(-1), None),
+            (None, None),
         ] {
-            assert_eq!(
-                observed(parent, 100, confirmations).on_best_chain(),
-                expected,
-                "{confirmations:?}",
-            );
+            let meta = CandidateMeta::from_header_bytes(
+                &header_with_parent(parent),
+                "ab".into(),
+                Some(&observed(parent, 100, confirmations)),
+            )
+            .unwrap();
+            assert_eq!(meta.observed_tip, expected, "{confirmations:?}");
         }
+    }
+
+    /// A tip that cannot be computed is not replaced by the polled one: the
+    /// candidate's metadata is refused.
+    #[test]
+    fn from_header_bytes_refuses_an_observed_tip_that_overflows() {
+        let parent = [5u8; 32];
+        assert_eq!(
+            CandidateMeta::from_header_bytes(
+                &header_with_parent(parent),
+                "ff".into(),
+                Some(&observed(parent, u64::MAX - 1, Some(3))),
+            )
+            .unwrap_err(),
+            CandidateMetaError::ObservedTipOverflow,
+        );
     }
 
     #[test]

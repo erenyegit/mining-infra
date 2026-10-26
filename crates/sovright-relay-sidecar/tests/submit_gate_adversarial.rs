@@ -140,7 +140,8 @@ async fn adversarial_header_mutation_rejects_mutated_candidate_hash() {
         height: 101,
         parent_hash: parent,
         block_hash_hex: "different_hash_string".to_string(),
-        parent_on_best_chain: false,
+        observed_tip: None,
+        parent_confirmations: None,
     };
     let chain = ConfigurableChain {
         tip: 100,
