@@ -796,6 +796,13 @@ mod tests {
         wtxid_from_tx_bytes(&v6_tx(), TX_READER_BRANCH_HINT).expect("v6 resolves")
     }
 
+    /// A real Sapling v4 transaction from mainnet block 3470793. It parses
+    /// whole, so a `None` for it comes from the version check, not from a parse
+    /// failure; `a_malformed_payload_is_not_cached_under_a_guess` covers that.
+    fn v4_tx() -> Vec<u8> {
+        zcash_pool_common::fixtures::mainnet_transactions()[3].clone()
+    }
+
     /// THE regression. A peer answered an earlier request out of order (or
     /// never answered it), so the front of the queue is some other
     /// transaction. Keying by the queue cached this payload under THAT wtxid --
@@ -861,9 +868,16 @@ mod tests {
     /// getblocktxn round trip, a wrong key costs a whole block.
     #[test]
     fn a_pre_v5_payload_is_not_cached_under_a_guess() {
-        let mut pending = request_window([TxInventoryKey::tx([0x77; 32])]);
-        // v4 transaction prefix: parses, but carries no auth digest.
-        let v4 = vec![0x04, 0x00, 0x00, 0x80, 0x01, 0x02, 0x03];
+        use zcash_primitives::transaction::{Transaction, TxVersion};
+        let v4 = v4_tx();
+        let mut cursor = std::io::Cursor::new(v4.as_slice());
+        let parsed =
+            Transaction::read(&mut cursor, TX_READER_BRANCH_HINT).expect("the v4 fixture parses");
+        assert_eq!(cursor.position() as usize, v4.len(), "and is read whole");
+        assert_eq!(parsed.version(), TxVersion::V4);
+
+        // A request for this very transaction, as a peer announces a v4.
+        let mut pending = request_window([TxInventoryKey::tx(*parsed.txid().as_ref())]);
         assert!(wtxid_for_received_tx(&mut pending, &v4).is_none());
         assert_eq!(pending.pending.len(), 1, "the request stays outstanding");
     }
@@ -943,6 +957,16 @@ mod tests {
         stream: TcpStream,
         task: tokio::task::JoinHandle<Result<()>>,
         log: std::path::PathBuf,
+        cache: TxCache,
+    }
+
+    /// The tx cache bounds `TestPeer` uses unless a test picks its own.
+    fn default_test_cache() -> crate::tx_cache::TxCacheConfig {
+        crate::tx_cache::TxCacheConfig {
+            max_entries: 8,
+            max_bytes: 4096,
+            max_tx_bytes: 4096,
+        }
     }
 
     impl Drop for TestPeer {
@@ -963,6 +987,24 @@ mod tests {
             config: Config,
             remote_version: i32,
         ) -> Self {
+            Self::start_inner(name, config, remote_version, default_test_cache()).await
+        }
+
+        async fn start_with_cache(
+            name: &str,
+            config: Config,
+            cache: crate::tx_cache::TxCacheConfig,
+        ) -> Self {
+            let version = config.network.protocol_version();
+            Self::start_inner(name, config, version, cache).await
+        }
+
+        async fn start_inner(
+            name: &str,
+            config: Config,
+            remote_version: i32,
+            cache_config: crate::tx_cache::TxCacheConfig,
+        ) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let log = temp_log_path(name);
@@ -970,17 +1012,13 @@ mod tests {
             let tx_feed = config.tx_feed_addr.map(TxFeedClient::new);
             let events = EventSink::for_network(Some(log.clone()), network).unwrap();
             let crawler = Crawler::new(&config, [address]);
-            let cache = TxCache::new(crate::tx_cache::TxCacheConfig {
-                max_entries: 8,
-                max_bytes: 4096,
-                max_tx_bytes: 4096,
-            });
+            let cache = TxCache::new(cache_config);
             let task = tokio::spawn(run_peer(
                 address,
                 config,
                 events,
                 None,
-                Some(cache),
+                Some(cache.clone()),
                 tx_feed,
                 crawler,
             ));
@@ -1006,6 +1044,7 @@ mod tests {
                 stream,
                 task,
                 log,
+                cache,
             };
             assert!(peer.barrier().await.is_empty());
             peer
@@ -1040,6 +1079,95 @@ mod tests {
                 .unwrap();
             self.barrier().await
         }
+    }
+
+    /// Every feed connection already made, read to EOF. Non-blocking accept, so
+    /// an empty result means none was made, not that none arrived in time.
+    fn accept_feed(listener: &std::net::TcpListener) -> Vec<String> {
+        let mut lines = Vec::new();
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    // Accepted sockets inherit O_NONBLOCK on macOS/BSD.
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut line = String::new();
+                    std::io::Read::read_to_string(&mut stream, &mut line).unwrap();
+                    lines.push(line);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return lines,
+                Err(error) => panic!("feed accept failed: {error}"),
+            }
+        }
+    }
+
+    fn logged_events(log: &std::path::Path) -> Vec<serde_json::Value> {
+        fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// Message level: a real v4 `tx` reaches the tx arm and leaves the cache and
+    /// the feed untouched; a v6 sent next is cached and fed under Zebra's wtxid
+    /// with its full payload. Every check runs after a ping/pong barrier, which
+    /// the peer answers only after handling each earlier message.
+    #[tokio::test]
+    async fn a_v4_tx_message_is_neither_cached_nor_fed_and_a_v6_is() {
+        use crate::wtxid::v6_equivalence::{V6_AUTHDIGEST_DISPLAY, V6_TXID_DISPLAY};
+        use sovright_relay::{MempoolProvider, TxFeedRecord};
+        use sovright_relay_sidecar::mempool_sync::wtxid_from_display_hex;
+
+        let feed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        feed.set_nonblocking(true).unwrap();
+        let mut config = peer_test_config();
+        config.tx_feed_addr = Some(feed.local_addr().unwrap());
+        // The v6 fixture is 12,322 bytes; the default test cache (4096) would
+        // drop it as too large and fail the positive control for that reason.
+        let cache = crate::tx_cache::TxCacheConfig {
+            max_entries: 8,
+            max_bytes: 65_536,
+            max_tx_bytes: 32_768,
+        };
+        assert!(v6_tx().len() <= cache.max_tx_bytes && v6_tx().len() <= cache.max_bytes);
+        let mut peer = TestPeer::start_with_cache("v4-tx-message", config, cache).await;
+        let network = peer.network;
+
+        write_message(&mut peer.stream, network, "tx", &v4_tx())
+            .await
+            .unwrap();
+        assert!(peer.barrier().await.is_empty());
+        assert_eq!(peer.cache.snapshot().entries, 0, "v4 is not cached");
+        assert_eq!(peer.cache.wtxid_for_payload(&v4_tx()), None);
+        assert!(accept_feed(&feed).is_empty(), "v4 does not reach the feed");
+        let events = logged_events(&peer.log);
+        assert!(events.iter().any(|event| event["event"] == "p2p_peer_error"
+            && event["error"] == "received tx with no derivable wtxid; not cached"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["event"] == "p2p_tx_received"
+                    || event["event"] == "p2p_tx_feed_forwarded")
+        );
+
+        // Positive control. The oracle is Zebra's display txid/authdigest for
+        // this fixture, not the from-bytes path under test.
+        let zebra = wtxid_from_display_hex(V6_TXID_DISPLAY, V6_AUTHDIGEST_DISPLAY).unwrap();
+        write_message(&mut peer.stream, network, "tx", &v6_tx())
+            .await
+            .unwrap();
+        assert!(peer.barrier().await.is_empty());
+        assert_eq!(peer.cache.get_wtxids(), vec![zebra]);
+        assert_eq!(peer.cache.get_tx_data(&zebra), Some(v6_tx()));
+        let lines = accept_feed(&feed);
+        assert_eq!(lines.len(), 1, "exactly one feed record, the v6");
+        assert_eq!(lines[0], TxFeedRecord::encode_line(zebra, &v6_tx()));
+        let record = TxFeedRecord::parse_line(lines[0].trim_end()).unwrap();
+        assert_eq!(record.wtxid, zebra);
+        assert_eq!(record.tx_bytes, v6_tx(), "full payload");
     }
 
     async fn rejected_forwarding_handshake(
