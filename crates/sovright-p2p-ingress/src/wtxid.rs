@@ -287,7 +287,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod v6_equivalence {
+pub(crate) mod v6_equivalence {
     use super::*;
     use sovright_relay_sidecar::mempool_sync::wtxid_from_display_hex;
 
@@ -302,9 +302,9 @@ mod v6_equivalence {
     /// against a v5 (NU5) vector -- v6 has its own ZIP-229 auth digest and was
     /// never checked.
     const V6_TX_HEX: &str = include_str!("../tests/fixtures/mainnet_v6_tx.hex");
-    const V6_TXID_DISPLAY: &str =
+    pub(crate) const V6_TXID_DISPLAY: &str =
         "b5e84a20ed799a4242f9f98a65f5654f02ab0e7dcd5ee6d5f54bee2d11affa63";
-    const V6_AUTHDIGEST_DISPLAY: &str =
+    pub(crate) const V6_AUTHDIGEST_DISPLAY: &str =
         "de6c0a19ff76d161cc6dc514faf51992b10b7078b5f2524d2a0b4bb9c4447ce4";
 
     // Parser compatibility only; signatures are not valid after this mutation.
