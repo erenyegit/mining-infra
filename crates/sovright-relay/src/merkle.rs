@@ -256,7 +256,9 @@ pub fn validate_block_transactions<'a>(
     if transactions.len() == 0 {
         return Err(BlockBodyError::EmptyTransactions);
     }
-    let mut bytes = header.len();
+    // What the block serializes to, so the count is included. `bytes` is within
+    // the limit before each addition, so the sum cannot overflow.
+    let mut bytes = header.len() + CompactSize::serialized_size(transactions.len());
     let mut txids = Vec::with_capacity(transactions.len());
     for (index, slice) in transactions.enumerate() {
         bytes += slice.len();
@@ -855,6 +857,50 @@ mod body_tests {
         );
     }
 
+    /// `count` transactions, the first padded so the block serializes to exactly
+    /// `block_bytes`.
+    fn block_of_size(count: usize, block_bytes: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let small: Vec<Vec<u8>> = (1..count as u32).map(parseable_transaction).collect();
+        let padding_overhead = parseable_transaction_with_script(0, 65_536).len() - 65_536;
+        let padded_bytes = block_bytes
+            - ZCASH_FULL_HEADER_SIZE
+            - CompactSize::serialized_size(count)
+            - small.iter().map(Vec::len).sum::<usize>();
+        let mut txs = vec![parseable_transaction_with_script(
+            0,
+            padded_bytes - padding_overhead,
+        )];
+        txs.extend(small);
+        (committed_header(0xcd, &txs), txs)
+    }
+
+    /// Both entry points limit what the block serializes to, which includes the
+    /// transaction count, and that count takes more bytes from 253 transactions.
+    #[test]
+    fn both_entry_points_limit_the_serialized_block() {
+        let mut disagreements = Vec::new();
+        for count in [1, 252, 253] {
+            for block_bytes in [MAX_BLOCK_BYTES, MAX_BLOCK_BYTES + 1] {
+                let (header, txs) = block_of_size(count, block_bytes);
+                let raw = raw_block(&header, &txs);
+                assert_eq!(raw.len(), block_bytes);
+
+                let expected = if block_bytes > MAX_BLOCK_BYTES {
+                    Err(BlockBodyError::TooLarge { bytes: block_bytes })
+                } else {
+                    Ok(count)
+                };
+                let from_raw = validate_block_body(&raw);
+                let from_slices =
+                    validate_block_transactions(&header, txs.iter().map(Vec::as_slice));
+                if from_raw != expected || from_slices != expected {
+                    disagreements.push((count, block_bytes, from_raw, from_slices));
+                }
+            }
+        }
+        assert!(disagreements.is_empty(), "{disagreements:#?}");
+    }
+
     /// Without the limit this would pass: the one oversized transaction parses
     /// and the header commits to it.
     #[test]
@@ -864,7 +910,7 @@ mod body_tests {
         assert_eq!(
             validate_block_transactions(&header, [tx.as_slice()].into_iter()),
             Err(BlockBodyError::TooLarge {
-                bytes: header.len() + tx.len()
+                bytes: raw_block(&header, std::slice::from_ref(&tx)).len()
             })
         );
     }

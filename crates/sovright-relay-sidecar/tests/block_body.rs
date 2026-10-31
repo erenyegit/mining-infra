@@ -5,14 +5,17 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use sovright_relay::test_support::{
+    committed_header, parseable_transaction_with_script, raw_block,
+};
 use sovright_relay::{
-    AuthDigest, BlockBodyError, CompactBlock, MempoolProvider, PrefilledTx, ShortId, TxId, WtxId,
-    zcash_block_hash,
+    AuthDigest, BlockBodyError, CompactBlock, MAX_BLOCK_BYTES, MempoolProvider, PrefilledTx,
+    ShortId, TxId, WtxId, ZCASH_FULL_HEADER_SIZE, zcash_block_hash,
 };
 use sovright_relay_sidecar::submit::{
-    RelayBlockError, SubmissionOutcome, SubmitBlock, SubmitBlockMode, SubmitBlockStatus,
-    SubmitFuture, build_raw_block_submission_candidate, build_submission_candidate,
-    handle_relay_compact_block, handle_relay_compact_block_with_gate,
+    RelayBlockError, SubmissionCandidate, SubmissionOutcome, SubmitBlock, SubmitBlockMode,
+    SubmitBlockStatus, SubmitFuture, build_raw_block_submission_candidate,
+    build_submission_candidate, handle_relay_compact_block, handle_relay_compact_block_with_gate,
     handle_relay_compact_block_with_mempool, handle_relay_raw_block,
     handle_relay_raw_block_with_gate,
 };
@@ -226,6 +229,52 @@ fn valid_blocks_keep_their_bytes_on_every_path() {
             .unwrap();
     assert_eq!(from_raw.block_hex, genuine);
     assert_eq!(from_raw.tx_count, txs.len());
+}
+
+/// A one-transaction block that serializes to exactly `block_bytes`.
+fn block_of_size(block_bytes: usize) -> (Vec<u8>, Vec<u8>) {
+    let overhead = parseable_transaction_with_script(0, 65_536).len() - 65_536;
+    let script_bytes = block_bytes - ZCASH_FULL_HEADER_SIZE - 1 - overhead;
+    let tx = parseable_transaction_with_script(0, script_bytes);
+    (committed_header(0xcd, std::slice::from_ref(&tx)), tx)
+}
+
+/// The compact and raw paths must agree at the edge of the limit: the compact
+/// candidate serializes the transaction count too.
+#[test]
+fn both_paths_limit_the_serialized_block() {
+    for block_bytes in [MAX_BLOCK_BYTES, MAX_BLOCK_BYTES + 1] {
+        let (header, tx) = block_of_size(block_bytes);
+        let raw = raw_block(&header, std::slice::from_ref(&tx));
+        assert_eq!(raw.len(), block_bytes);
+        let compact = CompactBlock::new(
+            header,
+            0,
+            Vec::new(),
+            vec![PrefilledTx {
+                index: 0,
+                tx_data: tx,
+            }],
+        );
+
+        let from_compact = build_submission_candidate(&compact);
+        let from_raw = build_raw_block_submission_candidate(&raw, None);
+        if block_bytes > MAX_BLOCK_BYTES {
+            let refused = |outcome: Result<SubmissionCandidate, RelayBlockError>| {
+                matches!(
+                    outcome,
+                    Err(RelayBlockError::InvalidBlockBody(BlockBodyError::TooLarge { bytes }))
+                        if bytes == block_bytes
+                )
+            };
+            assert!(refused(from_compact), "compact path, {block_bytes} bytes");
+            assert!(refused(from_raw), "raw path, {block_bytes} bytes");
+        } else {
+            let (from_compact, from_raw) = (from_compact.unwrap(), from_raw.unwrap());
+            assert_eq!(from_compact.block_hex, from_raw.block_hex);
+            assert_eq!(from_compact.block_bytes, block_bytes);
+        }
+    }
 }
 
 #[tokio::test]
