@@ -40,11 +40,66 @@ Measurement events include `p2p_connect_timing`, `p2p_handshake_timing`,
 `p2p_block_received`. These events are advisory telemetry only; crawler mode
 does not rotate connections by score yet.
 
+`p2p_block_received` is written as a block arrives, before it is parsed, and
+counts deliveries. It no longer carries `miner_script` or `miner_tag`: those are on
+a separate `p2p_block_coinbase` event with the same `hash`, `consensus_hash` and
+`peer`, written once the coinbase has been read off the async workers. Join on
+`hash`; do not count it as a delivery. With a relay bridge it appears once, for the
+validated copy that was sent on, and not for a refused body or a repeat of a known
+block. If the forward is cancelled or its send fails, the receipt stays and there
+is no coinbase line. Without a bridge every delivery is read, so a block has one
+line per delivery.
+
 The FORGE bridge is disabled unless both `SOVRIGHT_P2P_RELAY_PEERS` and
 `SOVRIGHT_P2P_RELAY_AUTH_KEY_HEX` are configured.
 `SOVRIGHT_P2P_RELAY_DATA_SHARDS` and `SOVRIGHT_P2P_RELAY_PARITY_SHARDS`
 override the default `10+3` FEC profile for relay traffic; they must match the
 relay daemon and receiving sidecar.
+
+## Refused block bodies
+
+`forward_block` validates a block body before forwarding it. A refused body is
+visible in two places:
+
+- The Prometheus counter `sovright_p2p_ingress_block_body_rejected_total{reason}`
+  counts refusals from P2P peers and the pool gateway. `reason` is one of
+  `too_large`, `invalid_header_length`, `invalid_count`, `empty_transactions`,
+  `transaction`, `transaction_boundary`, `trailing_bytes`, `duplicate_txid` and
+  `merkle_mismatch`. It is the only label.
+- The `p2p_block_body_rejected` JSON event identifies each refusal from a P2P
+  peer, with `peer`, `hash`, `consensus_hash`, `reason`, `detail` and `bytes`.
+  Pool gateway refusals are logged with their block hash instead.
+
+The counter reaches Prometheus through a textfile, as the sidecar's do. Set
+`SOVRIGHT_P2P_METRICS_TEXTFILE` to a `.prom` path that a textfile collector reads:
+
+```text
+SOVRIGHT_P2P_METRICS_TEXTFILE=/var/lib/sovright-p2p-ingress/metrics.prom
+```
+
+The file is rewritten every 30 seconds and starts at zero. It is written only
+while the relay bridge is enabled, and testnet rejects the setting. Give each
+process its own path: a collector refuses identical series from two files.
+
+Nothing here is an alert. Monitoring needs the collector to read this path and a
+rule of its own, for example:
+
+```text
+increase(sovright_p2p_ingress_block_body_rejected_total{reason="transaction"}[15m]) > 0
+```
+
+`transaction` and `trailing_bytes` can mean a valid block in a layout this reader
+does not know, so they are the reasons to watch around a network upgrade. A
+refused hash that later appears on chain is only a lead, because a bad body can
+carry a real block's header. It was a false rejection only if the node accepted
+those same bytes, and the event records their length, not a digest. Parsing is not
+consensus validation: these checks do not decide which transaction versions a
+height allows, and a block that passes them can still be invalid.
+
+With `SOVRIGHT_P2P_PEER_SCORING_ENABLED`, a refused body costs the peer
+`SOVRIGHT_P2P_PEER_SCORE_ERROR`, except for those two reasons. Only a block that is
+validated and sent on earns the delivery rewards: a deduplicated copy earns and
+costs nothing.
 
 ## Inventory limits
 

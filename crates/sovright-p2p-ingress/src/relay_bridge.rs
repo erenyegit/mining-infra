@@ -1,21 +1,27 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use sovright_relay::{
-    BlockBodyError, BlockChunker, BlockSender, ClientConfig, CompactBlock, MAX_PAYLOAD_SIZE,
-    RawBlockSegment, RelayClient, TransportError, split_raw_block, validate_block_body,
+    BlockBodyError, BlockChunker, BlockSender, ClientConfig, CompactBlock, MAX_BLOCK_BYTES,
+    MAX_PAYLOAD_SIZE, RawBlockSegment, RelayClient, TransportError, ZCASH_FULL_HEADER_SIZE,
+    parse_block_body, split_raw_block, zcash_block_hash,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, watch};
+use tokio::task::JoinError;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::block::{
-    compact_block_from_raw_block, compact_block_from_raw_block_with_tx_cache,
-    skeleton_compact_block_from_raw_block,
+    compact_block_from_parsed, compact_block_from_parsed_with_tx_cache,
+    skeleton_compact_block_from_parsed,
 };
+use crate::coinbase::CoinbaseTelemetry;
 use crate::config::Config;
 use crate::error::{IngressError, Result};
+use crate::metrics::{BlockBodyRejections, METRICS_WRITE_INTERVAL, spawn_metrics_textfile_writer};
 use crate::tx_cache::TxCache;
+use crate::wire::decode_compact_size;
 
 const RELAY_LEN_PREFIX_BYTES: usize = 4;
 
@@ -28,6 +34,15 @@ const RELAY_LEN_PREFIX_BYTES: usize = 4;
 /// blocks and skips oversized / cold-cache (large-prefill) ones.
 const SKELETON_MAX_WIRE_BYTES: usize = 8 * 1024;
 
+/// Block bodies prepared at once for P2P peers. A peer task waits for its own
+/// delivery, so `max_peers` limits how many queue here and this limits how many
+/// run, whatever the peers send.
+const P2P_PARSE_PERMITS: usize = 1;
+
+/// The same for the pool gateway. It has its own permits so that a found block
+/// never queues behind peer traffic.
+const POOL_PARSE_PERMITS: usize = 1;
+
 /// Bounded, time-windowed LRU of recently-forwarded block hashes. Used by
 /// `RelayBridge::forward_block` to implement first-seen-wins dedup so the
 /// same block being delivered by multiple P2P peers (the steady-state case)
@@ -37,6 +52,20 @@ struct RecentForwardedHashes {
     capacity: usize,
     window: Duration,
     entries: std::collections::VecDeque<([u8; 32], std::time::Instant)>,
+    /// Blocks being sent right now. Nothing is ever sent on these channels: a
+    /// [`ForwardClaim`] removes its entry when it ends, and that closes the
+    /// channel and wakes every copy waiting on it, however late they subscribed.
+    in_flight: HashMap<[u8; 32], watch::Sender<()>>,
+}
+
+/// Where a block stands, by its header hash.
+enum ForwardState {
+    /// Not forwarded, and no validated copy is being sent.
+    Open,
+    /// A validated copy is being sent; the receiver closes when that ends.
+    InFlight(watch::Receiver<()>),
+    /// Forwarded within the dedup window.
+    Forwarded,
 }
 
 impl RecentForwardedHashes {
@@ -45,6 +74,17 @@ impl RecentForwardedHashes {
             capacity,
             window,
             entries: std::collections::VecDeque::with_capacity(capacity.max(1)),
+            in_flight: HashMap::new(),
+        }
+    }
+
+    fn state(&mut self, hash: &[u8; 32], now: std::time::Instant) -> ForwardState {
+        if self.contains(hash, now) {
+            return ForwardState::Forwarded;
+        }
+        match self.in_flight.get(hash) {
+            Some(sender) => ForwardState::InFlight(sender.subscribe()),
+            None => ForwardState::Open,
         }
     }
 
@@ -75,6 +115,69 @@ impl RecentForwardedHashes {
     }
 }
 
+/// The right to send a validated block. Ending it any way but [`Self::commit`]
+/// -- a send error, a cancelled caller, a panic -- reopens the block, and a copy
+/// waiting on it sends instead of being deduplicated against a send that failed.
+struct ForwardClaim {
+    recent_forwarded: Arc<std::sync::Mutex<RecentForwardedHashes>>,
+    header_hash: [u8; 32],
+}
+
+impl ForwardClaim {
+    /// The block went out, so later copies of it are duplicates.
+    fn commit(self) {
+        let now = std::time::Instant::now();
+        if let Ok(mut recent) = self.recent_forwarded.lock() {
+            recent.record(self.header_hash, now);
+        }
+    }
+}
+
+impl Drop for ForwardClaim {
+    fn drop(&mut self) {
+        // Runs after `commit` too, so a woken copy finds the block recorded. This
+        // can run while unwinding, so a poisoned lock must not panic here.
+        self.recent_forwarded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .in_flight
+            .remove(&self.header_hash);
+    }
+}
+
+#[derive(Clone)]
+struct ParsePermits {
+    p2p: Arc<Semaphore>,
+    pool: Arc<Semaphore>,
+}
+
+impl ParsePermits {
+    fn new() -> Self {
+        Self {
+            p2p: Arc::new(Semaphore::new(P2P_PARSE_PERMITS)),
+            pool: Arc::new(Semaphore::new(POOL_PARSE_PERMITS)),
+        }
+    }
+}
+
+/// What a forward sends, built away from the async workers.
+struct PreparedForward {
+    tx_count: usize,
+    coinbase: CoinbaseTelemetry,
+    objects: PreparedObjects,
+}
+
+enum PreparedObjects {
+    /// The compact block does not fit the current FEC budget.
+    RawSegments(Vec<RawBlockSegment>),
+    Compact {
+        skeleton: Option<CompactBlock>,
+        compact: CompactBlock,
+        compact_wire_bytes: usize,
+        raw_fallback: Option<Vec<RawBlockSegment>>,
+    },
+}
+
 #[derive(Clone)]
 pub struct RelayBridge {
     sender: BlockSender,
@@ -94,6 +197,8 @@ pub struct RelayBridge {
     /// Shared dedup ring for first-seen-wins forward suppression. Cloned
     /// bridges share the same state via `Arc`.
     recent_forwarded: Arc<std::sync::Mutex<RecentForwardedHashes>>,
+    parse_permits: ParsePermits,
+    block_body_rejections: Arc<BlockBodyRejections>,
 }
 
 impl RelayBridge {
@@ -102,6 +207,9 @@ impl RelayBridge {
             // Relay bridging is simply not configured -- distinct from a
             // misconfiguration where peers are set but the auth key is
             // missing (see below).
+            if config.metrics_textfile.is_some() {
+                warn!("Metrics textfile configured without a relay bridge; nothing will write it");
+            }
             return Ok(None);
         }
         let Some(auth_key) = config.relay_auth_key else {
@@ -138,6 +246,14 @@ impl RelayBridge {
             raw_segment_round_delay_millis = config.relay_raw_segment_round_delay_millis,
             "Relay bridge enabled"
         );
+        let block_body_rejections = Arc::new(BlockBodyRejections::default());
+        if let Some(path) = &config.metrics_textfile {
+            spawn_metrics_textfile_writer(
+                Arc::clone(&block_body_rejections),
+                path.clone(),
+                METRICS_WRITE_INTERVAL,
+            );
+        }
         Ok(Some(Self {
             sender,
             data_shards: config.relay_data_shards,
@@ -157,6 +273,8 @@ impl RelayBridge {
                 config.relay_forward_dedup_capacity,
                 config.relay_forward_dedup_window,
             ))),
+            parse_permits: ParsePermits::new(),
+            block_body_rejections,
         }))
     }
 
@@ -186,6 +304,8 @@ impl RelayBridge {
                 config.relay_forward_dedup_capacity,
                 config.relay_forward_dedup_window,
             ))),
+            parse_permits: ParsePermits::new(),
+            block_body_rejections: Default::default(),
         })
     }
 
@@ -202,26 +322,64 @@ impl RelayBridge {
         RelayClient::new(client_config).map_err(|e| IngressError::Relay(e.to_string()))
     }
 
+    #[cfg(test)]
+    pub(crate) fn block_body_rejections(&self) -> &BlockBodyRejections {
+        &self.block_body_rejections
+    }
+
+    /// Forward a block a P2P peer delivered.
     pub async fn forward_block(
         &self,
         block_payload: &[u8],
         tx_cache: Option<&TxCache>,
     ) -> Result<ForwardedBlock> {
-        let compact = if self.compact_from_tx_cache {
-            if let Some(tx_cache) = tx_cache {
-                compact_block_from_raw_block_with_tx_cache(block_payload, tx_cache)?
-            } else {
-                compact_block_from_raw_block(block_payload)?
-            }
-        } else {
-            compact_block_from_raw_block(block_payload)?
-        };
-        let tx_count = compact.tx_count();
-        // Wire size of the compact object as serialized for the relay. The
-        // event's bytes field reports what is actually sent per mode (0 for
-        // deduplicated), NOT the full block size -- downstream consumers
-        // compare it against p2p_block_received bytes to measure savings.
-        let compact_wire_bytes = BlockChunker::serialize_compact_block(&compact).len();
+        self.forward_with_permits(block_payload, tx_cache, &self.parse_permits.p2p)
+            .await
+    }
+
+    /// Forward a block from the pool gateway.
+    pub async fn forward_pool_block(
+        &self,
+        block_payload: &[u8],
+        tx_cache: Option<&TxCache>,
+    ) -> Result<ForwardedBlock> {
+        self.forward_with_permits(block_payload, tx_cache, &self.parse_permits.pool)
+            .await
+    }
+
+    async fn forward_with_permits(
+        &self,
+        block_payload: &[u8],
+        tx_cache: Option<&TxCache>,
+        permits: &Arc<Semaphore>,
+    ) -> Result<ForwardedBlock> {
+        let outcome = self
+            .validate_and_forward(block_payload, tx_cache, permits)
+            .await;
+        if let Err(IngressError::InvalidBlockBody(error)) = &outcome {
+            self.block_body_rejections.record(error);
+        }
+        outcome
+    }
+
+    async fn validate_and_forward(
+        &self,
+        block_payload: &[u8],
+        tx_cache: Option<&TxCache>,
+        permits: &Arc<Semaphore>,
+    ) -> Result<ForwardedBlock> {
+        // Before anything waits or copies the payload.
+        if block_payload.len() > MAX_BLOCK_BYTES {
+            return Err(IngressError::InvalidBlockBody(BlockBodyError::TooLarge {
+                bytes: block_payload.len(),
+            }));
+        }
+        let header =
+            block_payload
+                .get(..ZCASH_FULL_HEADER_SIZE)
+                .ok_or(IngressError::InvalidBlockBody(
+                    BlockBodyError::InvalidHeaderLength,
+                ))?;
 
         // First-seen-wins dedup. Under steady state multiple Zcash P2P peers
         // deliver the same block within the same few hundred milliseconds.
@@ -229,111 +387,259 @@ impl RelayBridge {
         // block into the relay mesh, multiplying mesh traffic for no benefit.
         // The decision is recorded on successful broadcast so a half-failed
         // forward can be retried by the next delivery.
-        let header_hash = *compact.header_hash().as_bytes();
-        {
-            let now = std::time::Instant::now();
-            let mut ring = self
-                .recent_forwarded
-                .lock()
-                .expect("recent_forwarded mutex poisoned");
-            if ring.contains(&header_hash, now) {
-                return Ok(ForwardedBlock {
-                    tx_count,
-                    bytes: 0,
-                    relay_objects: 0,
-                    mode: ForwardMode::Deduplicated,
-                });
-            }
-        }
-        // After the dedup check, so a known header costs no hashing and a bad copy
+        let header_hash = zcash_block_hash(header);
+        let deduplicated = || ForwardedBlock {
+            tx_count: declared_tx_count(block_payload),
+            bytes: 0,
+            relay_objects: 0,
+            mode: ForwardMode::Deduplicated,
+            coinbase: CoinbaseTelemetry::default(),
+        };
+
+        // After the dedup check, so a known header costs no parsing and a bad copy
         // of one is skipped unsent; before any send, so a body that fails is
         // neither forwarded nor recorded and cannot hide a good copy.
-        check_forwarded_body(block_payload, &compact)?;
+        let (prepared, permit) = loop {
+            if self.wait_for_forward(&header_hash).await {
+                return Ok(deduplicated());
+            }
+            let permit = Arc::clone(permits)
+                .acquire_owned()
+                .await
+                .expect("parse permits are never closed");
+            // A copy ahead in the queue may have settled this block meanwhile.
+            if matches!(self.forward_state(&header_hash), ForwardState::Open) {
+                break self
+                    .prepare_off_workers(block_payload, tx_cache, permit)
+                    .await?;
+            }
+        };
+
+        // Only a validated body claims the block, and a copy that lost the race
+        // keeps what it prepared until the winner's send has really gone out. The
+        // permit is given up with the first attempt: the next copy in the queue
+        // then finds this claim, rather than an open block to parse again.
+        let Some(claim) = self.claim_forward(header_hash, permit).await else {
+            return Ok(deduplicated());
+        };
+        let forwarded = self.send_prepared(prepared).await?;
+        claim.commit();
+        Ok(forwarded)
+    }
+
+    fn forward_state(&self, header_hash: &[u8; 32]) -> ForwardState {
+        self.recent_forwarded
+            .lock()
+            .expect("recent_forwarded mutex poisoned")
+            .state(header_hash, std::time::Instant::now())
+    }
+
+    /// Wait out any send of this block in progress. True if it was forwarded,
+    /// false if it is open, as it is again after a send that did not finish.
+    async fn wait_for_forward(&self, header_hash: &[u8; 32]) -> bool {
+        loop {
+            match self.forward_state(header_hash) {
+                ForwardState::Open => return false,
+                ForwardState::Forwarded => return true,
+                ForwardState::InFlight(mut sending) => {
+                    let _ = sending.changed().await;
+                }
+            }
+        }
+    }
+
+    /// Claim a validated block, waiting out any send in progress without holding
+    /// `permit`. `None` if it was forwarded.
+    async fn claim_forward(
+        &self,
+        header_hash: [u8; 32],
+        permit: OwnedSemaphorePermit,
+    ) -> Option<ForwardClaim> {
+        let mut permit = Some(permit);
+        loop {
+            let state = {
+                let mut recent = self
+                    .recent_forwarded
+                    .lock()
+                    .expect("recent_forwarded mutex poisoned");
+                let state = recent.state(&header_hash, std::time::Instant::now());
+                if matches!(state, ForwardState::Open) {
+                    recent.in_flight.insert(header_hash, watch::channel(()).0);
+                }
+                state
+            };
+            drop(permit.take());
+            match state {
+                ForwardState::Open => {
+                    return Some(ForwardClaim {
+                        recent_forwarded: Arc::clone(&self.recent_forwarded),
+                        header_hash,
+                    });
+                }
+                ForwardState::Forwarded => return None,
+                ForwardState::InFlight(mut sending) => {
+                    let _ = sending.changed().await;
+                }
+            }
+        }
+    }
+
+    async fn prepare_off_workers(
+        &self,
+        block_payload: &[u8],
+        tx_cache: Option<&TxCache>,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<(PreparedForward, OwnedSemaphorePermit)> {
+        let bridge = self.clone();
+        let block = block_payload.to_vec();
+        let tx_cache = tx_cache.cloned();
+        let (prepared, permit) = run_holding_permit(permit, move || {
+            bridge.prepare_forward(block, tx_cache.as_ref())
+        })
+        .await
+        .map_err(|error| IngressError::Relay(format!("block preparation failed: {error}")))?;
+        Ok((prepared?, permit))
+    }
+
+    /// Validate a block and build everything that will be sent for it. Everything
+    /// is read from the parsed block, so it is what the reader checked.
+    fn prepare_forward(
+        &self,
+        block: Vec<u8>,
+        tx_cache: Option<&TxCache>,
+    ) -> Result<PreparedForward> {
+        let parsed = parse_block_body(block).map_err(IngressError::InvalidBlockBody)?;
+        let tx_cache = tx_cache.filter(|_| self.compact_from_tx_cache);
+        let compact = match tx_cache {
+            Some(tx_cache) => compact_block_from_parsed_with_tx_cache(&parsed, tx_cache)?,
+            None => compact_block_from_parsed(&parsed)?,
+        };
+        let tx_count = compact.tx_count();
+        let block_hash = *compact.header_hash().as_bytes();
+        let coinbase = CoinbaseTelemetry::of(parsed.coinbase());
+
         if let Err(error) = self.preflight_chunks(&compact) {
             let text = error.to_string();
             if text.contains("all-prefilled compact block too large") {
-                let segments =
-                    self.raw_block_segments(*compact.header_hash().as_bytes(), block_payload)?;
+                let segments = self.raw_block_segments(block_hash, parsed.raw_block())?;
+                return Ok(PreparedForward {
+                    tx_count,
+                    coinbase,
+                    objects: PreparedObjects::RawSegments(segments),
+                });
+            }
+            return Err(self.with_segment_plan(error, &compact, parsed.raw_block()));
+        }
+        // Skeleton fast path: emit the reconstruction-critical skeleton first
+        // (and with heavier FEC parity) so a receiver that already holds the
+        // block's transactions reconstructs and submits before the FEC'd compact
+        // bodies arrive. The full compact block is the push fallback, so it is
+        // ALWAYS sent afterward -- the skeleton never suppresses it. Only
+        // meaningful with tx-cache compaction (short_id compact blocks).
+        let skeleton = tx_cache
+            .filter(|_| self.skeleton_first)
+            .and_then(|tx_cache| {
+                match skeleton_compact_block_from_parsed(&parsed, tx_cache) {
+                    Ok(skeleton) => {
+                        // Small-block guard: the skeleton is only worth an extra
+                        // redundant, heavier-parity early copy when (a) it carries
+                        // short_ids a receiver can resolve from its own mempool --
+                        // an all-prefilled skeleton reconstructs from nothing, so
+                        // it would only ever duplicate the full block -- and (b) it
+                        // is small enough that the duplicate send is cheap. Oversized
+                        // / cold-cache (large-prefill) blocks are left to the full
+                        // compact block alone.
+                        let skeleton_bytes = BlockChunker::serialize_compact_block(&skeleton).len();
+                        (!skeleton.short_ids.is_empty()
+                            && skeleton_bytes <= SKELETON_MAX_WIRE_BYTES)
+                            .then_some(skeleton)
+                    }
+                    Err(error) => {
+                        warn!(%error, "Failed to build compact skeleton; sending full compact block only");
+                        None
+                    }
+                }
+            });
+        let raw_fallback = if self.raw_fallback_with_tx_cache
+            && self.compact_from_tx_cache
+            && !compact.short_ids.is_empty()
+        {
+            Some(self.raw_block_segments(block_hash, parsed.raw_block())?)
+        } else {
+            None
+        };
+        // Wire size of the compact object as serialized for the relay. The
+        // event's bytes field reports what is actually sent per mode (0 for
+        // deduplicated), NOT the full block size -- downstream consumers
+        // compare it against p2p_block_received bytes to measure savings.
+        let compact_wire_bytes = BlockChunker::serialize_compact_block(&compact).len();
+        Ok(PreparedForward {
+            tx_count,
+            coinbase,
+            objects: PreparedObjects::Compact {
+                skeleton,
+                compact,
+                compact_wire_bytes,
+                raw_fallback,
+            },
+        })
+    }
+
+    async fn send_prepared(&self, prepared: PreparedForward) -> Result<ForwardedBlock> {
+        let PreparedForward {
+            tx_count,
+            coinbase,
+            objects,
+        } = prepared;
+        let (compact_wire_bytes, raw_fallback) = match objects {
+            PreparedObjects::RawSegments(segments) => {
                 let raw_wire_bytes = self.raw_segments_wire_bytes(&segments);
                 let relay_objects = self.send_raw_block_segments(&segments).await?;
-                self.record_forwarded(header_hash);
                 return Ok(ForwardedBlock {
                     tx_count,
                     bytes: raw_wire_bytes,
                     relay_objects,
                     mode: ForwardMode::RawBlockSegments,
+                    coinbase,
                 });
             }
-            return Err(self.with_segment_plan(error, &compact, block_payload));
-        }
-        // Skeleton fast path: emit the reconstruction-critical skeleton first
-        // (and with heavier FEC parity) so a receiver that already holds the
-        // block's transactions reconstructs and submits before the FEC'd compact
-        // bodies arrive. The full compact block below is the push fallback, so it
-        // is ALWAYS sent afterward -- the skeleton never suppresses it. Only
-        // meaningful with tx-cache compaction (short_id compact blocks).
-        if self.skeleton_first
-            && self.compact_from_tx_cache
-            && let Some(tx_cache) = tx_cache
-        {
-            match skeleton_compact_block_from_raw_block(block_payload, tx_cache) {
-                Ok(skeleton) => {
-                    // Small-block guard: the skeleton is only worth an extra
-                    // redundant, heavier-parity early copy when (a) it carries
-                    // short_ids a receiver can resolve from its own mempool --
-                    // an all-prefilled skeleton reconstructs from nothing, so
-                    // it would only ever duplicate the full block -- and (b) it
-                    // is small enough that the duplicate send is cheap. Oversized
-                    // / cold-cache (large-prefill) blocks are left to the full
-                    // compact block alone.
-                    let skeleton_bytes = BlockChunker::serialize_compact_block(&skeleton).len();
-                    if !skeleton.short_ids.is_empty() && skeleton_bytes <= SKELETON_MAX_WIRE_BYTES {
-                        self.sender
-                            .send_skeleton(skeleton)
-                            .await
-                            .map_err(map_transport_error)?;
-                    }
+            PreparedObjects::Compact {
+                skeleton,
+                compact,
+                compact_wire_bytes,
+                raw_fallback,
+            } => {
+                if let Some(skeleton) = skeleton {
+                    self.sender
+                        .send_skeleton(skeleton)
+                        .await
+                        .map_err(map_transport_error)?;
                 }
-                Err(error) => {
-                    warn!(%error, "Failed to build compact skeleton; sending full compact block only");
-                }
+                self.sender
+                    .send(compact)
+                    .await
+                    .map_err(map_transport_error)?;
+                (compact_wire_bytes, raw_fallback)
             }
-        }
-        self.sender
-            .send(compact.clone())
-            .await
-            .map_err(map_transport_error)?;
-        if self.raw_fallback_with_tx_cache
-            && self.compact_from_tx_cache
-            && !compact.short_ids.is_empty()
-        {
-            let segments =
-                self.raw_block_segments(*compact.header_hash().as_bytes(), block_payload)?;
-            let raw_wire_bytes = self.raw_segments_wire_bytes(&segments);
-            let raw_segment_relay_objects = self.send_raw_block_segments(&segments).await?;
-            self.record_forwarded(header_hash);
+        };
+        let Some(segments) = raw_fallback else {
             return Ok(ForwardedBlock {
                 tx_count,
-                bytes: compact_wire_bytes + raw_wire_bytes,
-                relay_objects: raw_segment_relay_objects + 1,
-                mode: ForwardMode::CompactBlockWithRawFallback,
+                bytes: compact_wire_bytes,
+                relay_objects: 1,
+                mode: ForwardMode::CompactBlock,
+                coinbase,
             });
-        }
-        self.record_forwarded(header_hash);
+        };
+        let raw_wire_bytes = self.raw_segments_wire_bytes(&segments);
+        let raw_segment_relay_objects = self.send_raw_block_segments(&segments).await?;
         Ok(ForwardedBlock {
             tx_count,
-            bytes: compact_wire_bytes,
-            relay_objects: 1,
-            mode: ForwardMode::CompactBlock,
+            bytes: compact_wire_bytes + raw_wire_bytes,
+            relay_objects: raw_segment_relay_objects + 1,
+            mode: ForwardMode::CompactBlockWithRawFallback,
+            coinbase,
         })
-    }
-
-    /// Record a successfully-forwarded block hash in the dedup ring.
-    fn record_forwarded(&self, header_hash: [u8; 32]) {
-        let now = std::time::Instant::now();
-        if let Ok(mut ring) = self.recent_forwarded.lock() {
-            ring.record(header_hash, now);
-        }
     }
 
     fn with_segment_plan(
@@ -429,18 +735,26 @@ impl RelayBridge {
     }
 }
 
-/// Strictly validate a block about to be forwarded (#130). `compact` comes from
-/// the block parser and the check from the transaction reader, so their counts
-/// are compared too.
-fn check_forwarded_body(block_payload: &[u8], compact: &CompactBlock) -> Result<()> {
-    let parsed = validate_block_body(block_payload).map_err(IngressError::InvalidBlockBody)?;
-    let declared = compact.tx_count();
-    if parsed != declared {
-        return Err(IngressError::InvalidBlockBody(
-            BlockBodyError::CountMismatch { parsed, declared },
-        ));
-    }
-    Ok(())
+/// Run `work` on the blocking pool and hand `permit` back with its result.
+/// Dropping the returned future does not stop blocking work, so the permit goes
+/// with the work and not with the caller: with no caller left it ends with the
+/// work, and a panic in the work releases it too.
+pub(crate) async fn run_holding_permit<T, P>(
+    permit: P,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> std::result::Result<(T, P), JoinError>
+where
+    T: Send + 'static,
+    P: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || (work(), permit)).await
+}
+
+/// The transaction count a block declares, read without parsing its body, for
+/// reporting a delivery that was deduplicated. 0 if the count cannot be read.
+fn declared_tx_count(block_payload: &[u8]) -> usize {
+    let mut cursor = ZCASH_FULL_HEADER_SIZE;
+    decode_compact_size(block_payload, &mut cursor).map_or(0, |count| count as usize)
 }
 
 pub struct ForwardedBlock {
@@ -448,6 +762,8 @@ pub struct ForwardedBlock {
     pub bytes: usize,
     pub relay_objects: usize,
     pub mode: ForwardMode,
+    /// Empty for a deduplicated delivery, which was not read.
+    pub(crate) coinbase: CoinbaseTelemetry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -511,6 +827,8 @@ mod tests {
                 64,
                 Duration::from_secs(30),
             ))),
+            parse_permits: ParsePermits::new(),
+            block_body_rejections: Default::default(),
         }
     }
 
@@ -573,6 +891,8 @@ mod tests {
                 64,
                 Duration::from_secs(30),
             ))),
+            parse_permits: ParsePermits::new(),
+            block_body_rejections: Default::default(),
         };
 
         let t = std::time::Instant::now();
@@ -641,6 +961,8 @@ mod tests {
                 64,
                 Duration::from_secs(30),
             ))),
+            parse_permits: ParsePermits::new(),
+            block_body_rejections: Default::default(),
         };
 
         let forwarded = bridge
@@ -692,6 +1014,8 @@ mod tests {
                 64,
                 Duration::from_secs(30),
             ))),
+            parse_permits: ParsePermits::new(),
+            block_body_rejections: Default::default(),
         };
 
         let forwarded = bridge
@@ -792,6 +1116,8 @@ mod tests {
                 64,
                 Duration::from_secs(30),
             ))),
+            parse_permits: ParsePermits::new(),
+            block_body_rejections: Default::default(),
         };
         let raw_block = large_raw_block();
 
@@ -836,6 +1162,8 @@ mod tests {
                 64,
                 Duration::from_secs(30),
             ))),
+            parse_permits: ParsePermits::new(),
+            block_body_rejections: Default::default(),
         };
         let raw_block = large_raw_block();
 
@@ -883,6 +1211,8 @@ mod tests {
                 64,
                 Duration::from_secs(30),
             ))),
+            parse_permits: ParsePermits::new(),
+            block_body_rejections: Default::default(),
         };
         let (raw_block, _tx0, tx1) = two_tx_raw_block();
         let tx_cache = TxCache::new(TxCacheConfig {
@@ -945,6 +1275,8 @@ mod tests {
                 64,
                 Duration::from_secs(30),
             ))),
+            parse_permits: ParsePermits::new(),
+            block_body_rejections: Default::default(),
         };
         let (raw_block, _tx0, tx1) = two_tx_raw_block();
         let tx_cache = TxCache::new(TxCacheConfig {
@@ -996,6 +1328,8 @@ mod tests {
                 64,
                 Duration::from_secs(30),
             ))),
+            parse_permits: ParsePermits::new(),
+            block_body_rejections: Default::default(),
         };
         let (raw_block, _tx0, tx1) = two_tx_raw_block();
         let tx_cache = TxCache::new(TxCacheConfig {
@@ -1056,6 +1390,8 @@ mod tests {
                 64,
                 Duration::from_secs(30),
             ))),
+            parse_permits: ParsePermits::new(),
+            block_body_rejections: Default::default(),
         };
         let (raw_block, _tx0, _tx1) = two_tx_raw_block();
         // Empty cache => tx1 cannot resolve to a short_id => all-prefilled.
@@ -1118,6 +1454,7 @@ mod tests {
             tx_request_limit_per_inv: 256,
             inventory_limits: Default::default(),
             event_log: Some(PathBuf::from("/tmp/test.jsonl")),
+            metrics_textfile: None,
             relay_peers: vec!["127.0.0.1:1".parse().unwrap()],
             relay_bind_addr: "127.0.0.1:0".parse().unwrap(),
             relay_auth_key: Some([0x42; 32]),
@@ -1266,7 +1603,7 @@ mod nu7_transport_tests;
 
 #[cfg(test)]
 #[path = "block_body_tests.rs"]
-mod block_body_tests;
+pub(crate) mod block_body_tests;
 
 #[cfg(test)]
 #[path = "nu7_relay_path_tests.rs"]

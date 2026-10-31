@@ -255,6 +255,8 @@ async fn relay_loopback(
             4,
             Duration::from_secs(30),
         ))),
+        parse_permits: ParsePermits::new(),
+        block_body_rejections: Default::default(),
     };
     // Drop aborts all tasks, including on a failed assertion or timeout.
     let mut tasks = tokio::task::JoinSet::new();

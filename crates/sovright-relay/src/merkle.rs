@@ -27,6 +27,7 @@
 
 use std::collections::HashSet;
 use std::io::Cursor;
+use std::ops::Range;
 
 use crate::ZCASH_FULL_HEADER_SIZE;
 use sha2::{Digest, Sha256};
@@ -169,50 +170,115 @@ pub enum BlockBodyError {
     DuplicateTxid { index: usize },
     #[error("merkle root mismatch")]
     MerkleMismatch,
-    #[error("parsed {parsed} transactions, the relay object declared {declared}")]
-    CountMismatch { parsed: usize, declared: usize },
 }
 
 impl BlockBodyError {
-    /// Every metric label, in `label_index` order.
-    pub const LABELS: [&'static str; 10] = [
-        "too_large",
-        "invalid_header_length",
-        "invalid_count",
-        "empty_transactions",
-        "transaction",
-        "transaction_boundary",
-        "trailing_bytes",
-        "duplicate_txid",
-        "merkle_mismatch",
-        "count_mismatch",
+    /// One error of each kind, in metric order. Fields are placeholders.
+    pub const ALL: [Self; 9] = [
+        Self::TooLarge { bytes: 0 },
+        Self::InvalidHeaderLength,
+        Self::InvalidCount,
+        Self::EmptyTransactions,
+        Self::Transaction { index: 0 },
+        Self::TransactionBoundary { index: 0 },
+        Self::TrailingBytes { bytes: 0 },
+        Self::DuplicateTxid { index: 0 },
+        Self::MerkleMismatch,
     ];
 
-    /// Position of this error's label in [`Self::LABELS`].
-    pub fn label_index(&self) -> usize {
+    /// This error's metric label.
+    pub fn label(&self) -> &'static str {
         match self {
-            Self::TooLarge { .. } => 0,
-            Self::InvalidHeaderLength => 1,
-            Self::InvalidCount => 2,
-            Self::EmptyTransactions => 3,
-            Self::Transaction { .. } => 4,
-            Self::TransactionBoundary { .. } => 5,
-            Self::TrailingBytes { .. } => 6,
-            Self::DuplicateTxid { .. } => 7,
-            Self::MerkleMismatch => 8,
-            Self::CountMismatch { .. } => 9,
+            Self::TooLarge { .. } => "too_large",
+            Self::InvalidHeaderLength => "invalid_header_length",
+            Self::InvalidCount => "invalid_count",
+            Self::EmptyTransactions => "empty_transactions",
+            Self::Transaction { .. } => "transaction",
+            Self::TransactionBoundary { .. } => "transaction_boundary",
+            Self::TrailingBytes { .. } => "trailing_bytes",
+            Self::DuplicateTxid { .. } => "duplicate_txid",
+            Self::MerkleMismatch => "merkle_mismatch",
         }
+    }
+
+    /// Position of this error's kind in [`Self::ALL`].
+    pub fn kind_index(&self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|kind| kind.label() == self.label())
+            .expect("ALL holds every kind")
+    }
+}
+
+/// A block [`parse_block_body`] accepted, holding the bytes it checked.
+///
+/// Everything is read from those bytes, so the boundaries cannot be applied to
+/// another block, and a slice from here is a transaction the reader validated
+/// rather than another parser's reading of it. It owns them, not borrows, so the
+/// result can come back from a blocking task.
+///
+/// The fields are private, so that pairing cannot be built by hand:
+///
+/// ```compile_fail,E0451
+/// let parsed = sovright_relay::ParsedBlockBody {
+///     raw: Vec::new(),
+///     boundaries: Vec::new(),
+/// };
+/// ```
+#[derive(Debug)]
+pub struct ParsedBlockBody {
+    raw: Vec<u8>,
+    boundaries: Vec<Range<usize>>,
+    coinbase: Transaction,
+}
+
+impl ParsedBlockBody {
+    /// The serialized block.
+    pub fn raw_block(&self) -> &[u8] {
+        &self.raw
+    }
+
+    /// The serialized block header.
+    pub fn header(&self) -> &[u8] {
+        &self.raw[..ZCASH_FULL_HEADER_SIZE]
+    }
+
+    /// Each transaction's bytes, in block order.
+    pub fn transactions(&self) -> impl ExactSizeIterator<Item = &[u8]> {
+        self.boundaries
+            .iter()
+            .map(|boundary| &self.raw[boundary.clone()])
+    }
+
+    /// The first transaction as the reader read it, so nothing has to read it
+    /// again.
+    pub fn coinbase(&self) -> &Transaction {
+        &self.coinbase
     }
 }
 
 /// Strictly parse a serialized block and check its body against its header.
-/// Returns the transaction count.
 ///
 /// Unlike [`transactions_match_merkle_root`], a transaction that does not parse
 /// is refused rather than hashed: a block is only valid here if the reader
 /// consumes it exactly. This does not check proofs, signatures or which
 /// transaction versions an upgrade allows; those stay with the node.
+pub fn parse_block_body(raw_block: Vec<u8>) -> Result<ParsedBlockBody, BlockBodyError> {
+    let (boundaries, coinbase) = read_checked(&raw_block)?;
+    Ok(ParsedBlockBody {
+        raw: raw_block,
+        boundaries,
+        coinbase,
+    })
+}
+
+/// [`parse_block_body`] for a caller that needs only the transaction count and
+/// keeps its own bytes.
 pub fn validate_block_body(raw_block: &[u8]) -> Result<usize, BlockBodyError> {
+    read_checked(raw_block).map(|(boundaries, _)| boundaries.len())
+}
+
+fn read_checked(raw_block: &[u8]) -> Result<(Vec<Range<usize>>, Transaction), BlockBodyError> {
     if raw_block.len() > MAX_BLOCK_BYTES {
         return Err(BlockBodyError::TooLarge {
             bytes: raw_block.len(),
@@ -228,18 +294,24 @@ pub fn validate_block_body(raw_block: &[u8]) -> Result<usize, BlockBodyError> {
     }
     // The declared count is not trusted for allocation; reading stops at the
     // first transaction the bytes cannot supply.
+    let mut boundaries = Vec::new();
     let mut txids = Vec::new();
+    let mut coinbase = None;
     for index in 0..count as usize {
+        let start = ZCASH_FULL_HEADER_SIZE + cursor.position() as usize;
         let tx = Transaction::read(&mut cursor, TX_READER_BRANCH_HINT)
             .map_err(|_| BlockBodyError::Transaction { index })?;
+        boundaries.push(start..ZCASH_FULL_HEADER_SIZE + cursor.position() as usize);
         txids.push(*tx.txid().as_ref());
+        coinbase.get_or_insert(tx);
     }
     let trailing = body.len() - cursor.position() as usize;
     if trailing != 0 {
         return Err(BlockBodyError::TrailingBytes { bytes: trailing });
     }
     check_txids(header, &txids)?;
-    Ok(txids.len())
+    let coinbase = coinbase.ok_or(BlockBodyError::EmptyTransactions)?;
+    Ok((boundaries, coinbase))
 }
 
 /// The rules of [`validate_block_body`] for transactions that already have their
@@ -950,10 +1022,82 @@ mod body_tests {
         );
     }
 
+    /// The boundaries cover the body with no gap, so joining the transactions
+    /// gives back the block.
     #[test]
-    fn labels_are_distinct() {
-        let labels: HashSet<&str> = BlockBodyError::LABELS.iter().copied().collect();
-        assert_eq!(labels.len(), BlockBodyError::LABELS.len());
+    fn the_parsed_transactions_are_the_block_in_order() {
+        let (_, txs, raw) = real_block();
+        let (long_header, long_txs) = test_block(253);
+        for (raw, txs) in [(raw, txs), (raw_block(&long_header, &long_txs), long_txs)] {
+            let parsed = parse_block_body(raw.clone()).unwrap();
+            assert_eq!(parsed.transactions().collect::<Vec<_>>(), txs);
+            let boundaries = &parsed.boundaries;
+            assert!(
+                boundaries
+                    .windows(2)
+                    .all(|pair| pair[0].end == pair[1].start)
+            );
+            assert_eq!(boundaries.last().unwrap().end, raw.len());
+        }
+    }
+
+    /// Nothing takes a parsed block and a second payload, so each one answers
+    /// only from the bytes it checked.
+    #[test]
+    fn a_parsed_block_answers_from_the_bytes_it_checked() {
+        let (header, txs) = test_block(3);
+        let (_, _, real) = real_block();
+        for raw in [raw_block(&header, &txs), real] {
+            let parsed = parse_block_body(raw.clone()).unwrap();
+            assert_eq!(parsed.raw_block(), raw);
+            assert_eq!(parsed.header(), &raw[..ZCASH_FULL_HEADER_SIZE]);
+        }
+    }
+
+    #[test]
+    fn the_parsed_coinbase_is_the_first_transaction() {
+        let (_, txs, raw) = real_block();
+        let parsed = parse_block_body(raw).unwrap();
+        assert_eq!(
+            *parsed.coinbase().txid().as_ref(),
+            txid_from_tx_bytes(&txs[0])
+        );
+    }
+
+    /// It has to come back from a blocking task, so it cannot borrow from one.
+    #[test]
+    fn a_parsed_block_owns_what_it_reads() {
+        fn assert_owned<T: Send + 'static>() {}
+        assert_owned::<ParsedBlockBody>();
+    }
+
+    /// Written out here on purpose: swapping two labels fails, and a new kind
+    /// stops this match compiling until it is added here and to `ALL`.
+    #[test]
+    fn every_kind_is_listed_once_with_its_own_label() {
+        use BlockBodyError::*;
+        let expected = |error: &BlockBodyError| match error {
+            TooLarge { .. } => "too_large",
+            InvalidHeaderLength => "invalid_header_length",
+            InvalidCount => "invalid_count",
+            EmptyTransactions => "empty_transactions",
+            Transaction { .. } => "transaction",
+            TransactionBoundary { .. } => "transaction_boundary",
+            TrailingBytes { .. } => "trailing_bytes",
+            DuplicateTxid { .. } => "duplicate_txid",
+            MerkleMismatch => "merkle_mismatch",
+        };
+        assert_eq!(BlockBodyError::ALL.len(), 9);
+        let labels: HashSet<&str> = BlockBodyError::ALL.iter().map(|e| e.label()).collect();
+        assert_eq!(labels.len(), BlockBodyError::ALL.len());
+        for (position, kind) in BlockBodyError::ALL.iter().enumerate() {
+            assert_eq!(kind.label(), expected(kind));
+            assert_eq!(kind.kind_index(), position);
+        }
+        assert_eq!(
+            Transaction { index: 7 }.kind_index(),
+            Transaction { index: 0 }.kind_index()
+        );
     }
 
     trait ConcatWith {

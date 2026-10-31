@@ -94,6 +94,8 @@ pub struct Config {
     pub tx_request_limit_per_inv: usize,
     pub inventory_limits: InventoryLimits,
     pub event_log: Option<PathBuf>,
+    /// Optional Prometheus textfile for the relay bridge's metrics.
+    pub metrics_textfile: Option<PathBuf>,
     pub relay_peers: Vec<SocketAddr>,
     pub relay_bind_addr: SocketAddr,
     pub relay_auth_key: Option<[u8; 32]>,
@@ -211,6 +213,10 @@ impl Config {
         {
             return Err(IngressError::Config("testnet requires an explicit SOVRIGHT_P2P_EVENT_LOG isolated from mainnet collectors".to_string()));
         }
+        let metrics_textfile = env::var("SOVRIGHT_P2P_METRICS_TEXTFILE")
+            .ok()
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
         let relay_peers = env_socket_csv("SOVRIGHT_P2P_RELAY_PEERS")?;
         let relay_bind_addr = env::var("SOVRIGHT_P2P_RELAY_BIND_ADDR")
             .unwrap_or_else(|_| "0.0.0.0:0".to_string())
@@ -250,9 +256,12 @@ impl Config {
         let forwarding_min_peer_version = forwarding_min_peer_version_from_env(network)?;
 
         if network == Network::Testnet
-            && (!relay_peers.is_empty() || tx_feed_addr.is_some() || submitblock_rpc.is_some())
+            && (!relay_peers.is_empty()
+                || tx_feed_addr.is_some()
+                || submitblock_rpc.is_some()
+                || metrics_textfile.is_some())
         {
-            return Err(IngressError::Config("testnet is observation-only: relay peers, tx feed and submitblock RPC are forbidden".to_string()));
+            return Err(IngressError::Config("testnet is observation-only: relay peers, tx feed, submitblock RPC and the metrics textfile are forbidden".to_string()));
         }
         if seeds.is_empty() && peers.is_empty() {
             return Err(IngressError::Config(
@@ -293,6 +302,7 @@ impl Config {
             tx_request_limit_per_inv,
             inventory_limits,
             event_log,
+            metrics_textfile,
             relay_peers,
             relay_bind_addr,
             relay_auth_key,
@@ -609,6 +619,10 @@ mod tests {
             ("SOVRIGHT_P2P_RELAY_PEERS", "127.0.0.1:9000"),
             ("SOVRIGHT_P2P_TX_FEED_ADDR", "127.0.0.1:9001"),
             ("SOVRIGHT_P2P_SUBMITBLOCK_RPC_BIND_ADDR", "127.0.0.1:9002"),
+            (
+                "SOVRIGHT_P2P_METRICS_TEXTFILE",
+                "/tmp/nu7-test-metrics.prom",
+            ),
         ] {
             let _output = EnvGuard::set(&[(name, value.to_string())]);
             assert!(

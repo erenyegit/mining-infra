@@ -5,6 +5,7 @@ mod crawler;
 mod error;
 mod event;
 mod hash;
+mod metrics;
 mod peer;
 mod relay_bridge;
 mod submitblock_rpc;

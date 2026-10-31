@@ -30,9 +30,9 @@ pub use mempool::{
     TxCacheSnapshot,
 };
 pub use merkle::{
-    BlockBodyError, MAX_BLOCK_BYTES, TX_READER_BRANCH_HINT, header_merkle_root, merkle_root,
-    transactions_match_merkle_root, txid_from_tx_bytes, validate_block_body,
-    validate_block_transactions,
+    BlockBodyError, MAX_BLOCK_BYTES, ParsedBlockBody, TX_READER_BRANCH_HINT, header_merkle_root,
+    merkle_root, parse_block_body, transactions_match_merkle_root, txid_from_tx_bytes,
+    validate_block_body, validate_block_transactions,
 };
 pub use messages::{BlockTxn, GetBlockTxn, SendCmpct};
 pub use reconstructor::{CompactBlockReconstructor, ReconstructionResult};

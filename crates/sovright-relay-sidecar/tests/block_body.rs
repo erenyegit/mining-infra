@@ -4,9 +4,10 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use sovright_relay::test_support::{
-    committed_header, parseable_transaction_with_script, raw_block,
+    committed_header, parseable_transaction, parseable_transaction_with_script, raw_block,
 };
 use sovright_relay::{
     AuthDigest, BlockBodyError, CompactBlock, MAX_BLOCK_BYTES, MempoolProvider, PrefilledTx,
@@ -17,11 +18,13 @@ use sovright_relay_sidecar::submit::{
     SubmitBlockStatus, SubmitFuture, build_raw_block_submission_candidate,
     build_submission_candidate, handle_relay_compact_block, handle_relay_compact_block_with_gate,
     handle_relay_compact_block_with_mempool, handle_relay_raw_block,
-    handle_relay_raw_block_with_gate,
+    handle_relay_raw_block_with_gate, validate_then_gate_compact_block,
+    validate_then_gate_raw_block,
 };
 use sovright_relay_sidecar::submit_gate::{
     CandidateMeta, ChainView, GateConfig, ParentObservation, RejectReason, SubmitGate,
 };
+use tokio::time::timeout;
 use zcash_pool_common::fixtures;
 
 struct Zebra {
@@ -415,14 +418,153 @@ async fn the_short_id_path_refuses_a_repeated_final_transaction() {
     let zebra = Zebra::new();
     let (repeated, mempool) = short_id_block(&[1, 2, 3, 4, 5, 6, 6]);
     let outcome = handle_relay_compact_block_with_mempool(&zebra, &repeated, mode, &mempool).await;
-    assert!(
-        matches!(
-            &outcome,
-            Err(RelayBlockError::ReconstructionInvalid { reason })
-                if reason.contains("merkle root mismatch")
-        ),
-        "got {:?}",
-        outcome.map(|_| "a candidate")
+    assert_body_rejected(outcome, BlockBodyError::DuplicateTxid { index: 7 });
+    assert_eq!(zebra.calls(), 0);
+}
+
+/// Every short id resolves and the root matches the header it was built for, but
+/// a slot holds a transaction the reader cannot read. The merkle check alone
+/// used to pass this straight to the node.
+#[tokio::test]
+async fn the_short_id_path_refuses_a_slot_that_does_not_parse() {
+    let garbage = vec![0xff; 40];
+    let txs = [parseable_transaction(1), garbage.clone()];
+    let header = committed_header(0xcd, &txs);
+    let hash = zcash_block_hash(&header);
+    let compact = CompactBlock::new(
+        header,
+        0,
+        vec![ShortId::compute(&wtxid(1), &hash, 0)],
+        vec![PrefilledTx {
+            index: 0,
+            tx_data: txs[0].clone(),
+        }],
     );
+    let mempool = Mempool([(wtxid(1), garbage)].into_iter().collect());
+    let zebra = Zebra::new();
+
+    let outcome =
+        handle_relay_compact_block_with_mempool(&zebra, &compact, SubmitBlockMode::Live, &mempool)
+            .await;
+
+    assert_body_rejected(outcome, BlockBodyError::Transaction { index: 1 });
+    assert_eq!(zebra.calls(), 0);
+}
+
+/// Refused before either costly step: the lookup, a Zebra round trip, is never
+/// made, and the gate lock, held here by someone else, is never needed.
+#[tokio::test]
+async fn a_bad_gated_body_costs_no_parent_lookup_and_no_gate_lock() {
+    let zebra = Zebra::new();
+    let gate = tokio::sync::Mutex::new(gate());
+    let _held = gate.lock().await;
+    let lookups = AtomicUsize::new(0);
+    let look_up = || async {
+        lookups.fetch_add(1, Ordering::SeqCst);
+        Some(parent())
+    };
+    let mode = SubmitBlockMode::Live;
+    let limit = Duration::from_secs(30);
+    let bad_compact = compact(&bad_transactions());
+    let bad_raw = raw(&[7], &bad_transactions());
+
+    let from_compact = timeout(
+        limit,
+        validate_then_gate_compact_block(&zebra, &bad_compact, mode, &gate, look_up),
+    )
+    .await
+    .expect("a bad compact body must not wait for the gate");
+    let from_raw = timeout(
+        limit,
+        validate_then_gate_raw_block(&zebra, &bad_raw, Some(block_hash()), mode, &gate, look_up),
+    )
+    .await
+    .expect("a bad raw body must not wait for the gate");
+
+    assert_body_rejected(from_compact, BlockBodyError::MerkleMismatch);
+    assert_body_rejected(from_raw, BlockBodyError::MerkleMismatch);
+    assert_eq!(lookups.load(Ordering::SeqCst), 0);
+    assert_eq!(zebra.calls(), 0);
+}
+
+/// The other side of that test: a good body does make the lookup, once, and goes
+/// on through the gate.
+#[tokio::test]
+async fn a_good_gated_body_looks_up_its_parent_once_and_is_submitted() {
+    let mode = SubmitBlockMode::Live;
+    let lookups = AtomicUsize::new(0);
+    let look_up = || async {
+        lookups.fetch_add(1, Ordering::SeqCst);
+        Some(parent())
+    };
+
+    let zebra = Zebra::new();
+    let gated = tokio::sync::Mutex::new(gate());
+    let good = compact(&fixtures::mainnet_transactions());
+    let outcome = validate_then_gate_compact_block(&zebra, &good, mode, &gated, look_up).await;
+    assert_submitted(outcome);
+    assert_eq!(lookups.load(Ordering::SeqCst), 1);
+    assert_eq!(zebra.calls(), 1);
+
+    let zebra = Zebra::new();
+    let gated = tokio::sync::Mutex::new(gate());
+    let good = fixtures::mainnet_raw_block();
+    let outcome =
+        validate_then_gate_raw_block(&zebra, &good, Some(block_hash()), mode, &gated, look_up)
+            .await;
+    assert_submitted(outcome);
+    assert_eq!(lookups.load(Ordering::SeqCst), 2);
+    assert_eq!(zebra.calls(), 1);
+}
+
+/// With a good body the lock is needed, so the wait is real: this is what makes
+/// the bad body's clean return above a statement about order.
+#[tokio::test]
+async fn a_good_gated_body_waits_for_the_gate_lock() {
+    let zebra = Zebra::new();
+    let gate = tokio::sync::Mutex::new(gate());
+    let held = gate.lock().await;
+    let good = compact(&fixtures::mainnet_transactions());
+    let mode = SubmitBlockMode::Live;
+    let submit =
+        validate_then_gate_compact_block(&zebra, &good, mode, &gate, || async { Some(parent()) });
+    tokio::pin!(submit);
+
+    tokio::select! {
+        biased;
+        _ = &mut submit => panic!("it went through a held gate"),
+        () = tokio::task::yield_now() => {}
+    }
+    assert_eq!(zebra.calls(), 0);
+
+    drop(held);
+    assert_submitted(submit.await);
+    assert_eq!(zebra.calls(), 1);
+}
+
+/// The tests above exercise the helpers. This pins that the receive loop uses
+/// them: it has no gate lock or parent lookup of its own to put back in front of
+/// validation.
+#[test]
+fn the_receive_loop_validates_before_the_lookup_and_the_lock() {
+    let src = include_str!("../src/main.rs");
+
+    assert_eq!(src.matches("validate_then_gate_compact_block(").count(), 1);
+    assert_eq!(src.matches("validate_then_gate_raw_block(").count(), 1);
+    assert!(!src.contains("gate.lock()"), "main.rs takes the gate lock");
+    assert!(!src.contains("handle_relay_compact_block_with_gate"));
+    assert!(!src.contains("handle_relay_raw_block_with_gate"));
+}
+
+/// `EmptyTransactions` is a body refusal on the raw path too, so it reaches the
+/// body metric under its own label.
+#[tokio::test]
+async fn an_empty_raw_block_is_a_body_refusal() {
+    let empty = raw(&[0], &[]);
+    let zebra = Zebra::new();
+
+    let outcome = handle_relay_raw_block(&zebra, &empty, None, SubmitBlockMode::Live).await;
+
+    assert_body_rejected(outcome, BlockBodyError::EmptyTransactions);
     assert_eq!(zebra.calls(), 0);
 }

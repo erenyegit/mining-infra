@@ -7,9 +7,8 @@ use sovright_relay::{
     WtxId, ZCASH_FULL_HEADER_SIZE, reassemble_raw_block, zcash_block_hash,
 };
 use std::collections::HashMap;
-use std::fs;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -28,12 +27,12 @@ use sovright_relay_sidecar::compact::build_compact_block;
 use sovright_relay_sidecar::config;
 use sovright_relay_sidecar::dual_submit::{DualSubmit, SecondarySample, build_submitter};
 use sovright_relay_sidecar::mempool_sync::run_zebra_mempool_sync;
+use sovright_relay_sidecar::metrics_textfile::write_metrics_textfile;
 use sovright_relay_sidecar::rpc::ZebraRpc;
 use sovright_relay_sidecar::submit::{
     RelayBlockError, SubmissionOutcome, SubmitBlock, SubmitBlockMode, SubmitBlockStatus,
-    SubmitRejectionClass, handle_relay_compact_block, handle_relay_compact_block_with_gate,
-    handle_relay_compact_block_with_mempool, handle_relay_raw_block,
-    handle_relay_raw_block_with_gate,
+    SubmitRejectionClass, handle_relay_compact_block, handle_relay_compact_block_with_mempool,
+    handle_relay_raw_block, validate_then_gate_compact_block, validate_then_gate_raw_block,
 };
 use sovright_relay_sidecar::submit_gate::SubmitGate;
 use tokio::sync::Mutex as TokioMutex;
@@ -736,20 +735,14 @@ where
                                     );
                                     continue;
                                 }
-                                let parent = chain_view
-                                    .observe_candidate_parent(rpc.as_ref(), &compact.header)
-                                    .await;
-                                let outcome = {
-                                    let mut gate_guard = gate.lock().await;
-                                    handle_relay_compact_block_with_gate(
-                                        submitter.as_ref(),
-                                        &compact,
-                                        mode,
-                                        &mut gate_guard,
-                                        parent.as_ref(),
-                                    )
-                                    .await
-                                };
+                                let outcome = validate_then_gate_compact_block(
+                                    submitter.as_ref(),
+                                    &compact,
+                                    mode,
+                                    gate,
+                                    || chain_view.observe_candidate_parent(rpc.as_ref(), &compact.header),
+                                )
+                                .await;
                                 // Per-cause GateRejected metric is incremented in
                                 // log_submission_outcome; here we tick the
                                 // accepted-by-gate counter for outcomes that came
@@ -861,17 +854,13 @@ where
                                              let raw_outcome = if let (Some(gate), Some(chain_view)) =
                                                  (&gate, &chain_view)
                                             {
-                                                let parent = chain_view
-                                                    .observe_candidate_parent(rpc.as_ref(), &raw_block)
-                                                    .await;
-                                                let mut gate_guard = gate.lock().await;
-                                                handle_relay_raw_block_with_gate(
+                                                validate_then_gate_raw_block(
                                                     submitter.as_ref(),
                                                     &raw_block,
                                                     Some(block_hash),
                                                     mode,
-                                                    &mut gate_guard,
-                                                    parent.as_ref(),
+                                                    gate,
+                                                    || chain_view.observe_candidate_parent(rpc.as_ref(), &raw_block),
                                                 )
                                                 .await
                                             } else {
@@ -1507,15 +1496,24 @@ fn classify_reconstruction_invalid(reason: &str) -> &'static str {
         "duplicate_prefilled"
     } else if reason.contains("out of bounds") {
         "prefilled_out_of_bounds"
-    } else if reason.contains("merkle root mismatch") {
-        // The reconstructor now verifies the header commitment, so this is the
-        // expected label for a short-id collision or a stale mempool copy --
-        // failures that previously reached Zebra as a submit rejection instead
-        // of being caught locally. It needs its own bucket precisely because it
-        // is the one we expect to see.
-        "merkle_mismatch"
     } else {
         "other"
+    }
+}
+
+/// The same bucket for a filled block that failed body validation.
+///
+/// A merkle mismatch is the expected label for a short-id collision or a stale
+/// mempool copy -- failures that previously reached Zebra as a submit rejection
+/// instead of being caught locally. It needs its own bucket precisely because it
+/// is the one we expect to see, and a repeated txid needs another: its root can
+/// match, so counting it as a mismatch sends whoever reads the metric after
+/// short-id collisions that never happened.
+fn classify_invalid_assembly(error: &BlockBodyError) -> &'static str {
+    match error {
+        BlockBodyError::MerkleMismatch => "merkle_mismatch",
+        BlockBodyError::DuplicateTxid { .. } => "duplicate_txid",
+        _ => "other",
     }
 }
 
@@ -1573,6 +1571,11 @@ fn record_compact_reconstruction_outcome(
                 "Compact block reconstruction produced an invalid block"
             );
         }
+        Err(RelayBlockError::InvalidBlockBody(error)) => {
+            let kind = classify_invalid_assembly(error);
+            metrics.inc_compact_reconstruction_invalids(kind);
+            warn!(%error, kind, "Compact block reconstruction produced an invalid block");
+        }
         Err(error) => {
             // Previously folded into the invalid counter, which made "invalid"
             // a catch-all that overstated true reconstruction invalidity and
@@ -1593,8 +1596,9 @@ struct SidecarMetrics {
     compact_reconstruction_invalids_duplicate_prefilled: AtomicU64,
     compact_reconstruction_invalids_out_of_bounds: AtomicU64,
     compact_reconstruction_invalids_merkle_mismatch: AtomicU64,
+    compact_reconstruction_invalids_duplicate_txid: AtomicU64,
     compact_reconstruction_invalids_other: AtomicU64,
-    block_body_rejections: [AtomicU64; BlockBodyError::LABELS.len()],
+    block_body_rejections: [AtomicU64; BlockBodyError::ALL.len()],
     compact_reconstruction_errors: AtomicU64,
     compact_reconstruction_missing_wtxids: AtomicU64,
     compact_reconstruction_unresolved_short_ids: AtomicU64,
@@ -1704,7 +1708,7 @@ impl SidecarMetrics {
     }
 
     fn inc_block_body_rejected(&self, error: &BlockBodyError) {
-        self.block_body_rejections[error.label_index()].fetch_add(1, Ordering::Relaxed);
+        self.block_body_rejections[error.kind_index()].fetch_add(1, Ordering::Relaxed);
     }
 
     fn inc_compact_reconstruction_invalids(&self, kind: &str) {
@@ -1712,6 +1716,7 @@ impl SidecarMetrics {
             "duplicate_prefilled" => &self.compact_reconstruction_invalids_duplicate_prefilled,
             "prefilled_out_of_bounds" => &self.compact_reconstruction_invalids_out_of_bounds,
             "merkle_mismatch" => &self.compact_reconstruction_invalids_merkle_mismatch,
+            "duplicate_txid" => &self.compact_reconstruction_invalids_duplicate_txid,
             _ => &self.compact_reconstruction_invalids_other,
         }
         .fetch_add(1, Ordering::Relaxed);
@@ -1915,6 +1920,9 @@ impl SidecarMetrics {
         let cri_merkle_mismatch = self
             .compact_reconstruction_invalids_merkle_mismatch
             .load(Ordering::Relaxed);
+        let cri_duplicate_txid = self
+            .compact_reconstruction_invalids_duplicate_txid
+            .load(Ordering::Relaxed);
         let cri_other = self
             .compact_reconstruction_invalids_other
             .load(Ordering::Relaxed);
@@ -2005,6 +2013,7 @@ impl SidecarMetrics {
                 "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total{{reason=\"duplicate_prefilled\"}} {cri_duplicate_prefilled}\n",
                 "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total{{reason=\"prefilled_out_of_bounds\"}} {cri_out_of_bounds}\n",
                 "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total{{reason=\"merkle_mismatch\"}} {cri_merkle_mismatch}\n",
+                "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total{{reason=\"duplicate_txid\"}} {cri_duplicate_txid}\n",
                 "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total{{reason=\"other\"}} {cri_other}\n",
                 "# TYPE sovright_relay_sidecar_relay_compact_reconstruction_errors_total counter\n",
                 "sovright_relay_sidecar_relay_compact_reconstruction_errors_total {compact_reconstruction_errors}\n",
@@ -2103,6 +2112,7 @@ impl SidecarMetrics {
             cri_duplicate_prefilled = cri_duplicate_prefilled,
             cri_out_of_bounds = cri_out_of_bounds,
             cri_merkle_mismatch = cri_merkle_mismatch,
+            cri_duplicate_txid = cri_duplicate_txid,
             cri_other = cri_other,
             compact_reconstruction_errors = compact_reconstruction_errors,
             compact_reconstruction_missing_wtxids = compact_reconstruction_missing_wtxids,
@@ -2156,12 +2166,10 @@ impl SidecarMetrics {
             submit_gate_rejected_duplicate = submit_gate_rejected_duplicate,
         );
         text.push_str("# TYPE sovright_relay_sidecar_relay_block_body_rejected_total counter\n");
-        for (label, count) in BlockBodyError::LABELS
-            .iter()
-            .zip(&self.block_body_rejections)
-        {
+        for (kind, count) in BlockBodyError::ALL.iter().zip(&self.block_body_rejections) {
             text.push_str(&format!(
-                "sovright_relay_sidecar_relay_block_body_rejected_total{{reason=\"{label}\"}} {}\n",
+                "sovright_relay_sidecar_relay_block_body_rejected_total{{reason=\"{}\"}} {}\n",
+                kind.label(),
                 count.load(Ordering::Relaxed)
             ));
         }
@@ -2187,19 +2195,6 @@ fn spawn_metrics_textfile_writer(
             }
         }
     });
-}
-
-fn write_metrics_textfile(
-    path: &Path,
-    text: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, text)?;
-    fs::rename(tmp, path)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2659,8 +2654,8 @@ mod tests {
         let now = Instant::now();
 
         let nonce = 9;
-        let coinbase = vec![0x01, 0x02];
-        let tx1 = vec![0x03, 0x04, 0x05];
+        let coinbase = parseable_transaction(1);
+        let tx1 = parseable_transaction(2);
         let header = header_committing_to(&[coinbase.clone(), tx1.clone()]);
         let wtxid = make_wtxid(0x11);
         let short_id = ShortId::compute(&wtxid, &zcash_block_hash(&header), nonce);
@@ -3145,8 +3140,8 @@ mod tests {
         let nonce = 42;
         let coinbase_wtxid = make_wtxid(0x01);
         let tx1_wtxid = make_wtxid(0x02);
-        let coinbase = vec![0x01, 0x02];
-        let tx1 = vec![0x03, 0x04, 0x05];
+        let coinbase = parseable_transaction(1);
+        let tx1 = parseable_transaction(2);
         let header = header_committing_to(&[coinbase.clone(), tx1.clone()]);
         let mut builder = CompactBlockBuilder::new(header.clone(), nonce);
         builder.add_transaction(coinbase_wtxid, coinbase.clone());
@@ -3542,12 +3537,13 @@ mod tests {
     /// and needs its own bucket instead of being swept into `other`.
     #[test]
     fn a_merkle_mismatch_gets_its_own_bucket() {
-        assert_eq!(
-            classify_reconstruction_invalid("merkle root mismatch"),
-            "merkle_mismatch"
-        );
         let m = SidecarMetrics::default();
-        m.inc_compact_reconstruction_invalids("merkle_mismatch");
+        record_compact_reconstruction_outcome(
+            &Err(RelayBlockError::InvalidBlockBody(
+                BlockBodyError::MerkleMismatch,
+            )),
+            &m,
+        );
         assert_eq!(
             m.compact_reconstruction_invalids_merkle_mismatch
                 .load(Ordering::Relaxed),
@@ -3558,6 +3554,51 @@ mod tests {
                 .load(Ordering::Relaxed),
             0,
             "a merkle mismatch must not also land in other"
+        );
+    }
+
+    /// A repeated txid keeps the root, so nobody chasing short-id collisions from
+    /// the mismatch counter should be sent after one.
+    #[test]
+    fn a_repeated_txid_gets_its_own_bucket_not_the_mismatch_one() {
+        let m = SidecarMetrics::default();
+        record_compact_reconstruction_outcome(
+            &Err(RelayBlockError::InvalidBlockBody(
+                BlockBodyError::DuplicateTxid { index: 6 },
+            )),
+            &m,
+        );
+
+        let text = m.render_prometheus_text();
+        let invalids = "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total";
+        assert!(
+            text.contains(&format!("{invalids}{{reason=\"duplicate_txid\"}} 1\n")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{invalids}{{reason=\"merkle_mismatch\"}} 0\n")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{invalids}{{reason=\"other\"}} 0\n")),
+            "{text}"
+        );
+        assert_eq!(m.compact_reconstruction_invalids.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn other_body_failures_of_a_filled_block_land_in_other() {
+        let m = SidecarMetrics::default();
+        record_compact_reconstruction_outcome(
+            &Err(RelayBlockError::InvalidBlockBody(
+                BlockBodyError::Transaction { index: 2 },
+            )),
+            &m,
+        );
+        assert_eq!(
+            m.compact_reconstruction_invalids_other
+                .load(Ordering::Relaxed),
+            1
         );
     }
 

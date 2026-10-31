@@ -634,7 +634,7 @@ fn rejection_class_strings_are_stable() {
 // --- every submit path classifies its rejections -------------------------
 //
 // Rejection classification was added in #88 but wired into only ONE of the five
-// places that call submit_block. The raw-segment path -- which carries almost
+// places that then called submit_block. The raw-segment path -- which carries almost
 // all traffic -- was not among them, so on 2026-09-03 the fleet showed 119
 // rejections, every single one labelled `unknown`, with race_lost and invalid
 // both at zero. The labels existed and classified nothing.
@@ -652,8 +652,8 @@ fn no_submit_path_classifies_by_hand() {
     assert_eq!(
         src.matches("classify_submitblock_outcome(result, submitter")
             .count(),
-        5,
-        "expected all five submit_block call sites to use the shared classifier"
+        4,
+        "expected all four submit_block call sites to use the shared classifier"
     );
 }
 

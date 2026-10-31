@@ -379,9 +379,13 @@ pub fn build_submission_candidate_with_mempool<M: MempoolProvider>(
         ReconstructionResult::Invalid { reason } => {
             Err(RelayBlockError::ReconstructionInvalid { reason })
         }
+        ReconstructionResult::InvalidBody(error) => Err(RelayBlockError::InvalidBlockBody(error)),
     }
 }
 
+/// Serialize transactions the reconstructor already validated against `header`.
+/// Its one call is on `ReconstructionResult::Complete`, which is why it stays
+/// private: nothing else may reach a candidate without that check.
 fn build_submission_candidate_from_transactions(
     header: &[u8],
     transactions: &[Vec<u8>],
@@ -427,10 +431,7 @@ pub fn build_raw_block_submission_candidate(
         return Err(RelayBlockError::RawBlockHashMismatch);
     }
 
-    let tx_count = validate_block_body(raw_block).map_err(|error| match error {
-        BlockBodyError::EmptyTransactions => RelayBlockError::EmptyTransactions,
-        error => RelayBlockError::InvalidBlockBody(error),
-    })?;
+    let tx_count = validate_block_body(raw_block).map_err(RelayBlockError::InvalidBlockBody)?;
 
     Ok(SubmissionCandidate {
         block_hash: hex::encode(block_hash),
@@ -561,33 +562,7 @@ where
     V: crate::submit_gate::ChainView,
 {
     let candidate = build_submission_candidate(compact)?;
-    let meta = crate::submit_gate::CandidateMeta::from_header_bytes(
-        &compact.header,
-        candidate.block_hash.clone(),
-        parent,
-    )
-    .map_err(candidate_meta_error)?;
-
-    match gate.apply_now(&candidate, &meta) {
-        crate::submit_gate::GateDecision::Accept => {}
-        crate::submit_gate::GateDecision::Reject(reason) => {
-            return Ok(SubmissionOutcome::GateRejected { candidate, reason });
-        }
-    }
-
-    match mode {
-        SubmitBlockMode::DryRun => Ok(SubmissionOutcome::DryRun(candidate)),
-        SubmitBlockMode::Live => {
-            let result = submitter
-                .submit_block(&candidate.block_hex)
-                .await
-                .map_err(|error| RelayBlockError::SubmitFailed(error.to_string()))?;
-            let status =
-                classify_submitblock_outcome(result, submitter, &candidate.consensus_block_hash)
-                    .await?;
-            Ok(SubmissionOutcome::Submitted { candidate, status })
-        }
-    }
+    submit_through_gate(submitter, candidate, &compact.header, mode, gate, parent).await
 }
 
 /// Handle one relay raw block, evaluating the safety gate against the
@@ -608,17 +583,96 @@ where
     V: crate::submit_gate::ChainView,
 {
     let candidate = build_raw_block_submission_candidate(raw_block, expected_block_hash)?;
+    let header = raw_block_header(raw_block)?;
+    submit_through_gate(submitter, candidate, header, mode, gate, parent).await
+}
 
-    // Raw blocks carry the full header at the start. Extract the prev_hash
-    // from the first ZCASH_FULL_HEADER_SIZE bytes; the gate metadata needs it.
-    let header = raw_block.get(..ZCASH_FULL_HEADER_SIZE).ok_or_else(|| {
-        RelayBlockError::ReconstructionInvalid {
+/// [`handle_relay_compact_block_with_gate`], validating the candidate first: a
+/// bad body costs neither the parent lookup, which is a Zebra round trip, nor a
+/// wait for the gate lock while a good copy may be queued behind it.
+pub async fn validate_then_gate_compact_block<S, V, L, F>(
+    submitter: &S,
+    compact: &CompactBlock,
+    mode: SubmitBlockMode,
+    gate: &tokio::sync::Mutex<crate::submit_gate::SubmitGate<V>>,
+    look_up_parent: L,
+) -> Result<SubmissionOutcome, RelayBlockError>
+where
+    S: SubmitBlock + Sync,
+    V: crate::submit_gate::ChainView,
+    L: FnOnce() -> F,
+    F: Future<Output = Option<crate::submit_gate::ParentObservation>>,
+{
+    let candidate = build_submission_candidate(compact)?;
+    let parent = look_up_parent().await;
+    let mut gate = gate.lock().await;
+    submit_through_gate(
+        submitter,
+        candidate,
+        &compact.header,
+        mode,
+        &mut gate,
+        parent.as_ref(),
+    )
+    .await
+}
+
+/// [`validate_then_gate_compact_block`] for a reassembled raw block.
+pub async fn validate_then_gate_raw_block<S, V, L, F>(
+    submitter: &S,
+    raw_block: &[u8],
+    expected_block_hash: Option<[u8; 32]>,
+    mode: SubmitBlockMode,
+    gate: &tokio::sync::Mutex<crate::submit_gate::SubmitGate<V>>,
+    look_up_parent: L,
+) -> Result<SubmissionOutcome, RelayBlockError>
+where
+    S: SubmitBlock + Sync,
+    V: crate::submit_gate::ChainView,
+    L: FnOnce() -> F,
+    F: Future<Output = Option<crate::submit_gate::ParentObservation>>,
+{
+    let candidate = build_raw_block_submission_candidate(raw_block, expected_block_hash)?;
+    let header = raw_block_header(raw_block)?;
+    let parent = look_up_parent().await;
+    let mut gate = gate.lock().await;
+    submit_through_gate(
+        submitter,
+        candidate,
+        header,
+        mode,
+        &mut gate,
+        parent.as_ref(),
+    )
+    .await
+}
+
+/// Raw blocks carry the full header at the start. The gate metadata needs its
+/// prev_hash.
+fn raw_block_header(raw_block: &[u8]) -> Result<&[u8], RelayBlockError> {
+    raw_block
+        .get(..ZCASH_FULL_HEADER_SIZE)
+        .ok_or_else(|| RelayBlockError::ReconstructionInvalid {
             reason: format!(
                 "raw block shorter than the {} byte header prefix",
                 ZCASH_FULL_HEADER_SIZE
             ),
-        }
-    })?;
+        })
+}
+
+/// Run a validated candidate through the gate and, if it passes, the mode.
+async fn submit_through_gate<S, V>(
+    submitter: &S,
+    candidate: SubmissionCandidate,
+    header: &[u8],
+    mode: SubmitBlockMode,
+    gate: &mut crate::submit_gate::SubmitGate<V>,
+    parent: Option<&crate::submit_gate::ParentObservation>,
+) -> Result<SubmissionOutcome, RelayBlockError>
+where
+    S: SubmitBlock + Sync,
+    V: crate::submit_gate::ChainView,
+{
     let meta = crate::submit_gate::CandidateMeta::from_header_bytes(
         header,
         candidate.block_hash.clone(),
@@ -658,7 +712,7 @@ fn candidate_meta_error(error: crate::submit_gate::CandidateMetaError) -> RelayB
 
 /// Submit-result classification WITH the follow-up lookup, for every submit path.
 ///
-/// There are five places that call `submit_block`. When rejection classification
+/// There were five places that called `submit_block`. When rejection classification
 /// was added in #88 only one of them was wired up, so the other four -- including
 /// the raw-segment path, which carries almost all traffic -- left the class at
 /// `Unknown`. The result was 119 rejections fleet-wide on 2026-09-03, every one
@@ -729,6 +783,7 @@ fn raw_block_header_hash(header: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sovright_relay::test_support::parseable_transaction;
     use sovright_relay::{
         AuthDigest, CompactBlock, PrefilledTx, ShortId, TestMempool, TxId, WtxId,
     };
@@ -814,15 +869,15 @@ mod tests {
     #[test]
     fn submission_candidate_reconstructs_short_ids_from_mempool() {
         let nonce = 42;
-        let coinbase = vec![0x01, 0x02];
-        let tx1 = vec![0x03, 0x04, 0x05];
+        let coinbase = parseable_transaction(1);
+        let tx1 = parseable_transaction(2);
         let tx1_wtxid = make_wtxid(0x11);
         // Reconstruction verifies the header's merkle commitment, so the test
         // header has to actually commit to these two transactions. An arbitrary
         // filler header would now (correctly) be rejected before this path is
         // reached, and the test would prove nothing about short-id resolution.
         let header = {
-            let mut h = vec![0xcd; 2189];
+            let mut h = vec![0xcd; ZCASH_FULL_HEADER_SIZE];
             let txids: Vec<[u8; 32]> = [&coinbase, &tx1]
                 .iter()
                 .map(|t| sovright_relay::txid_from_tx_bytes(t))

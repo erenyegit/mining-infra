@@ -7,12 +7,13 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+use crate::coinbase::coinbase_telemetry_off_workers;
 use crate::config::Config;
 use crate::crawler::Crawler;
 use crate::error::{IngressError, Result};
 use crate::event::EventSink;
 use crate::hash::{inventory_hash_to_display, raw_hash_from_header};
-use crate::relay_bridge::RelayBridge;
+use crate::relay_bridge::{ForwardMode, ForwardedBlock, RelayBridge};
 use crate::tx_cache::{TxCache, TxInventoryKey};
 use crate::tx_feed::TxFeedClient;
 use crate::wire::{
@@ -21,7 +22,7 @@ use crate::wire::{
 };
 use crate::wire::{MIN_ACCEPTABLE_REMOTE_VERSION, Network};
 use crate::wtxid::{TX_READER_BRANCH_HINT, wtxid_from_tx_bytes};
-use sovright_relay::WtxId;
+use sovright_relay::{BlockBodyError, WtxId};
 
 // Advertising less than we demand of peers would be incoherent; enforce at
 // compile time so a future upgrade cannot raise the floor past what we send.
@@ -333,27 +334,19 @@ pub async fn run_peer(
                     .get(..sovright_relay::ZCASH_FULL_HEADER_SIZE)
                     .map(sovright_relay::consensus_block_hash_display)
                     .unwrap_or_default();
-                // Best-effort: capture the coinbase miner payout script and the
-                // pool tag at hear-time. A None never blocks the forward below.
-                let miner_script = crate::coinbase::coinbase_miner_script(&msg.payload);
-                let miner_tag = crate::coinbase::coinbase_text(&msg.payload);
-                events.p2p_block_received(
-                    &peer,
-                    &display,
-                    &consensus_hash,
-                    msg.payload.len(),
-                    miner_script.as_deref(),
-                    miner_tag.as_deref(),
-                )?;
-                crawler.score_peer(
-                    peer_addr,
-                    config.peer_score_block_received,
-                    "block_received",
-                    &events,
-                )?;
+                // Nothing here needs parsing, so the receipt is on record before
+                // anything can wait, and survives whatever happens to the forward.
+                events.p2p_block_received(&peer, &display, &consensus_hash, msg.payload.len())?;
                 if let Some(relay) = &relay {
-                    match relay.forward_block(&msg.payload, tx_cache.as_ref()).await {
+                    let outcome = relay.forward_block(&msg.payload, tx_cache.as_ref()).await;
+                    match &outcome {
                         Ok(forwarded) => {
+                            events.p2p_block_coinbase(
+                                &peer,
+                                &display,
+                                &consensus_hash,
+                                &forwarded.coinbase,
+                            )?;
                             events.p2p_relay_block_forwarded(
                                 &peer,
                                 &display,
@@ -362,18 +355,33 @@ pub async fn run_peer(
                                 forwarded.mode.as_str(),
                                 forwarded.relay_objects,
                             )?;
-                            crawler.score_peer(
-                                peer_addr,
-                                config.peer_score_relay_forwarded,
-                                "relay_forwarded",
-                                &events,
-                            )?;
                         }
                         Err(error) => {
+                            if let IngressError::InvalidBlockBody(rejection) = error {
+                                events.p2p_block_body_rejected(
+                                    &peer,
+                                    &display,
+                                    &consensus_hash,
+                                    rejection,
+                                    msg.payload.len(),
+                                )?;
+                            }
                             events
                                 .p2p_peer_error(&peer, &format!("relay forward failed: {error}"))?;
                         }
                     }
+                    for (delta, reason) in delivery_scores(&config, &outcome) {
+                        crawler.score_peer(peer_addr, delta, reason, &events)?;
+                    }
+                } else {
+                    let coinbase = coinbase_telemetry_off_workers(&msg.payload).await;
+                    events.p2p_block_coinbase(&peer, &display, &consensus_hash, &coinbase)?;
+                    crawler.score_peer(
+                        peer_addr,
+                        config.peer_score_block_received,
+                        "block_received",
+                        &events,
+                    )?;
                 }
             }
             "tx" => {
@@ -419,6 +427,32 @@ pub async fn run_peer(
             _ => {}
         }
     }
+}
+
+/// What a delivery earns once the relay has judged it. Only a block validated and
+/// sent on is rewarded: a deduplicated copy was not parsed, so it says nothing
+/// about the peer either way, and a relay failure is not the peer's doing.
+fn delivery_scores(config: &Config, outcome: &Result<ForwardedBlock>) -> Vec<(i64, &'static str)> {
+    match outcome {
+        Ok(forwarded) if forwarded.mode == ForwardMode::Deduplicated => Vec::new(),
+        Ok(_) => vec![
+            (config.peer_score_block_received, "block_received"),
+            (config.peer_score_relay_forwarded, "relay_forwarded"),
+        ],
+        Err(IngressError::InvalidBlockBody(error)) if !may_be_a_reader_gap(error) => {
+            vec![(config.peer_score_error, "invalid_block_body")]
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+/// A valid block in a layout this reader does not know fails with one of these.
+/// Every honest peer delivers that block, so they cannot be held against a peer.
+fn may_be_a_reader_gap(error: &BlockBodyError) -> bool {
+    matches!(
+        error,
+        BlockBodyError::Transaction { .. } | BlockBodyError::TrailingBytes { .. }
+    )
 }
 
 fn emit_tx_cache_snapshot(events: &EventSink, cache: &TxCache) -> Result<()> {
@@ -595,6 +629,10 @@ fn nonce() -> u64 {
 mod tests {
     use super::*;
     use crate::hash::display_hash_from_header;
+    use crate::relay_bridge::block_body_tests::{
+        compact_blocks_of, eventually, fill_send_channel, good_and_bad, harness, hash_of,
+        hold_p2p_permit, in_flight,
+    };
     use crate::tx_cache::TxInventoryKey;
     use crate::wire::{MSG_TX, MSG_WTX};
     use std::fs;
@@ -932,6 +970,7 @@ mod tests {
             tx_request_limit_per_inv: 256,
             inventory_limits: Default::default(),
             event_log: None,
+            metrics_textfile: None,
             relay_peers: Vec::new(),
             relay_bind_addr: "127.0.0.1:0".parse().unwrap(),
             relay_auth_key: None,
@@ -987,7 +1026,12 @@ mod tests {
             config: Config,
             remote_version: i32,
         ) -> Self {
-            Self::start_inner(name, config, remote_version, default_test_cache()).await
+            Self::start_inner(name, config, remote_version, default_test_cache(), None).await
+        }
+
+        async fn start_with_relay(name: &str, config: Config, relay: RelayBridge) -> Self {
+            let version = config.network.protocol_version();
+            Self::start_inner(name, config, version, default_test_cache(), Some(relay)).await
         }
 
         async fn start_with_cache(
@@ -996,7 +1040,7 @@ mod tests {
             cache: crate::tx_cache::TxCacheConfig,
         ) -> Self {
             let version = config.network.protocol_version();
-            Self::start_inner(name, config, version, cache).await
+            Self::start_inner(name, config, version, cache, None).await
         }
 
         async fn start_inner(
@@ -1004,6 +1048,7 @@ mod tests {
             config: Config,
             remote_version: i32,
             cache_config: crate::tx_cache::TxCacheConfig,
+            relay: Option<RelayBridge>,
         ) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -1017,7 +1062,7 @@ mod tests {
                 address,
                 config,
                 events,
-                None,
+                relay,
                 Some(cache.clone()),
                 tx_feed,
                 crawler,
@@ -1072,6 +1117,42 @@ mod tests {
             .unwrap()
         }
 
+        async fn send_block(&mut self, raw: &[u8]) {
+            let network = self.network;
+            write_message(&mut self.stream, network, "block", raw)
+                .await
+                .unwrap();
+        }
+
+        /// Deliver a block and wait until the peer task has finished with it.
+        async fn deliver(&mut self, raw: &[u8]) {
+            self.send_block(raw).await;
+            self.barrier().await;
+        }
+
+        /// Cancel the peer task, as a rotation or a shutdown would.
+        async fn cancel(&mut self) {
+            self.task.abort();
+            match (&mut self.task).await {
+                Err(error) => assert!(error.is_cancelled()),
+                Ok(_) => panic!("the peer task finished before it was cancelled"),
+            }
+        }
+
+        fn events(&self, name: &str) -> Vec<serde_json::Value> {
+            logged_events(&self.log)
+                .into_iter()
+                .filter(|event| event["event"] == name)
+                .collect()
+        }
+
+        fn score_reasons(&self) -> Vec<String> {
+            self.events("p2p_peer_score")
+                .iter()
+                .map(|event| event["reason"].as_str().unwrap().to_owned())
+                .collect()
+        }
+
         async fn announce(&mut self, items: &[Inventory]) -> Vec<Inventory> {
             let network = self.network;
             write_message(&mut self.stream, network, "inv", &encode_inventory(items))
@@ -1109,6 +1190,312 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    fn scored_config() -> Config {
+        let mut config = peer_test_config();
+        config.peer_scoring_enabled = true;
+        config
+    }
+
+    /// A body the reader refuses outright, where the header commits to the bytes.
+    fn unparseable_block() -> Vec<u8> {
+        use sovright_relay::test_support::{committed_header, parseable_transaction, raw_block};
+        let txs = [parseable_transaction(1), vec![0xff; 40]];
+        raw_block(&committed_header(0xcd, &txs), &txs)
+    }
+
+    #[tokio::test]
+    async fn a_refused_body_is_logged_counted_and_costs_the_peer() {
+        let (_, bad) = good_and_bad();
+        let harness = harness();
+        let relay = harness.bridge.clone();
+        let mut peer = TestPeer::start_with_relay("body-refused", scored_config(), relay).await;
+
+        peer.deliver(&bad).await;
+
+        let rejected = peer.events("p2p_block_body_rejected");
+        let [event] = rejected.as_slice() else {
+            panic!("expected one rejection, got {rejected:?}");
+        };
+        assert_eq!(event["reason"], "merkle_mismatch");
+        assert_eq!(event["detail"], "merkle root mismatch");
+        assert_eq!(event["bytes"], bad.len());
+        assert_eq!(
+            event["hash"],
+            display_hash_from_header(&bad).unwrap().as_str()
+        );
+        assert_eq!(
+            event["consensus_hash"],
+            sovright_relay::consensus_block_hash_display(
+                &bad[..sovright_relay::ZCASH_FULL_HEADER_SIZE]
+            )
+        );
+        assert_eq!(peer.events("p2p_peer_error").len(), 1);
+        assert_eq!(peer.score_reasons(), ["invalid_block_body"]);
+        assert_eq!(peer.events("p2p_peer_score")[0]["score"], -50);
+    }
+
+    /// Both can be a valid block this reader does not know, which every honest
+    /// peer would deliver. They are logged and counted, and cost nobody anything.
+    #[tokio::test]
+    async fn a_body_the_reader_may_have_misread_costs_the_peer_nothing() {
+        let (good, _) = good_and_bad();
+        let mut with_trailing_byte = good;
+        with_trailing_byte.push(0);
+        let harness = harness();
+        let relay = harness.bridge.clone();
+        let mut peer = TestPeer::start_with_relay("reader-gap", scored_config(), relay).await;
+
+        peer.deliver(&unparseable_block()).await;
+        peer.deliver(&with_trailing_byte).await;
+
+        let reasons: Vec<_> = peer
+            .events("p2p_block_body_rejected")
+            .iter()
+            .map(|event| event["reason"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(reasons, ["transaction", "trailing_bytes"]);
+        assert!(
+            peer.score_reasons().is_empty(),
+            "{:?}",
+            peer.score_reasons()
+        );
+        let rejections = harness.bridge.block_body_rejections();
+        assert_eq!(rejections.count("transaction"), 1);
+        assert_eq!(rejections.count("trailing_bytes"), 1);
+    }
+
+    /// The first delivery was validated and sent. The rest were not parsed, good
+    /// or bad, so they earn and cost nothing, however they read.
+    #[tokio::test]
+    async fn only_a_validated_new_block_earns_the_delivery_rewards() {
+        let (good, bad) = good_and_bad();
+        let harness = harness();
+        let relay = harness.bridge.clone();
+        let mut peer = TestPeer::start_with_relay("rewards", scored_config(), relay).await;
+
+        peer.deliver(&good).await;
+        assert_eq!(
+            peer.score_reasons(),
+            ["block_received", "relay_forwarded"],
+            "a validated new block"
+        );
+
+        peer.deliver(&good).await;
+        peer.deliver(&bad).await;
+        peer.deliver(&good[..good.len() - 1]).await;
+
+        assert_eq!(peer.score_reasons().len(), 2, "{:?}", peer.score_reasons());
+        let forwarded = peer.events("p2p_relay_block_forwarded");
+        let modes: Vec<_> = forwarded.iter().map(|event| &event["mode"]).collect();
+        assert_eq!(
+            modes,
+            [
+                "compact_block",
+                "deduplicated",
+                "deduplicated",
+                "deduplicated"
+            ]
+        );
+        assert!(peer.events("p2p_block_body_rejected").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_relay_failure_costs_the_peer_nothing() {
+        use crate::relay_bridge::block_body_tests::Harness;
+        let (good, _) = good_and_bad();
+        let Harness {
+            bridge, outgoing, ..
+        } = harness();
+        drop(outgoing);
+        let mut peer = TestPeer::start_with_relay("relay-down", scored_config(), bridge).await;
+
+        peer.deliver(&good).await;
+
+        assert_eq!(peer.events("p2p_peer_error").len(), 1);
+        assert!(peer.events("p2p_block_body_rejected").is_empty());
+        assert!(
+            peer.score_reasons().is_empty(),
+            "{:?}",
+            peer.score_reasons()
+        );
+    }
+
+    fn unix_time_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    fn event_names(peer: &TestPeer, kept: &[&str]) -> Vec<String> {
+        logged_events(&peer.log)
+            .iter()
+            .map(|event| event["event"].as_str().unwrap().to_owned())
+            .filter(|name| kept.contains(&name.as_str()))
+            .collect()
+    }
+
+    const BLOCK_EVENTS: [&str; 4] = [
+        "p2p_block_received",
+        "p2p_block_coinbase",
+        "p2p_block_body_rejected",
+        "p2p_relay_block_forwarded",
+    ];
+
+    /// One receipt per delivery, and one coinbase line for the block that was read:
+    /// the enrichment has its own name, so counting receipts stays right.
+    #[tokio::test]
+    async fn every_delivery_is_one_receipt_and_only_a_validated_new_block_has_a_coinbase() {
+        let (good, bad) = good_and_bad();
+        let harness = harness();
+        let relay = harness.bridge.clone();
+        let mut peer = TestPeer::start_with_relay("coinbase", peer_test_config(), relay).await;
+
+        peer.deliver(&bad).await;
+        peer.deliver(&good).await;
+        peer.deliver(&good).await;
+
+        assert_eq!(
+            event_names(&peer, &BLOCK_EVENTS),
+            [
+                "p2p_block_received",
+                "p2p_block_body_rejected",
+                "p2p_block_received",
+                "p2p_block_coinbase",
+                "p2p_relay_block_forwarded",
+                "p2p_block_received",
+                "p2p_relay_block_forwarded",
+            ]
+        );
+        let received = peer.events("p2p_block_received");
+        assert!(
+            received
+                .iter()
+                .all(|event| event.get("miner_script").is_none())
+        );
+        let coinbase = peer.events("p2p_block_coinbase");
+        assert!(coinbase[0]["miner_script"].is_string());
+        assert_eq!(coinbase[0]["hash"], received[1]["hash"]);
+        assert_eq!(coinbase[0]["consensus_hash"], received[1]["consensus_hash"]);
+        assert_eq!(coinbase[0]["peer"], received[1]["peer"]);
+    }
+
+    /// The forward is held at its permit, so it cannot have finished. The receipt
+    /// is already in the log, and its time is before the permit was released.
+    #[tokio::test]
+    async fn the_receipt_is_logged_while_the_forward_waits_for_a_permit() {
+        let (good, _) = good_and_bad();
+        let harness = harness();
+        let relay = harness.bridge.clone();
+        let mut peer = TestPeer::start_with_relay("receipt", peer_test_config(), relay).await;
+        let permit = hold_p2p_permit(&harness.bridge).await;
+
+        peer.send_block(&good).await;
+        eventually(|| peer.events("p2p_block_received").len() == 1).await;
+
+        assert!(peer.events("p2p_relay_block_forwarded").is_empty());
+        let released_at = unix_time_ms();
+        drop(permit);
+        peer.barrier().await;
+
+        let arrived = peer.events("p2p_block_received")[0]["observed_at_unix_ms"]
+            .as_u64()
+            .unwrap();
+        let forwarded = peer.events("p2p_relay_block_forwarded")[0]["observed_at_unix_ms"]
+            .as_u64()
+            .unwrap();
+        assert!(arrived <= released_at, "{arrived} > {released_at}");
+        assert!(released_at <= forwarded, "{released_at} > {forwarded}");
+    }
+
+    #[tokio::test]
+    async fn a_forward_cancelled_at_its_permit_leaves_the_receipt() {
+        let (good, _) = good_and_bad();
+        let hash = hash_of(&good);
+        let harness = harness();
+        let relay = harness.bridge.clone();
+        let mut peer = TestPeer::start_with_relay("cancel-queue", peer_test_config(), relay).await;
+        let permit = hold_p2p_permit(&harness.bridge).await;
+        peer.send_block(&good).await;
+        eventually(|| peer.events("p2p_block_received").len() == 1).await;
+
+        peer.cancel().await;
+        drop(permit);
+
+        assert_eq!(peer.events("p2p_block_received").len(), 1);
+        assert_eq!(peer.events("p2p_block_received")[0]["bytes"], good.len());
+        assert!(peer.events("p2p_relay_block_forwarded").is_empty());
+        assert!(!in_flight(&harness.bridge, &hash));
+    }
+
+    /// Past validation, holding the claim, waiting to send: the latest a forward
+    /// can be cancelled. The claim goes and the receipt stays.
+    #[tokio::test]
+    async fn a_forward_cancelled_during_its_send_leaves_the_receipt() {
+        let (good, _) = good_and_bad();
+        let hash = hash_of(&good);
+        let mut harness = harness();
+        fill_send_channel(&harness.bridge).await;
+        let relay = harness.bridge.clone();
+        let mut peer = TestPeer::start_with_relay("cancel-send", peer_test_config(), relay).await;
+        peer.send_block(&good).await;
+        eventually(|| in_flight(&harness.bridge, &hash)).await;
+        assert_eq!(peer.events("p2p_block_received").len(), 1);
+
+        peer.cancel().await;
+
+        assert!(!in_flight(&harness.bridge, &hash));
+        assert_eq!(peer.events("p2p_block_received").len(), 1);
+        assert!(peer.events("p2p_relay_block_forwarded").is_empty());
+        assert_eq!(compact_blocks_of(&harness.sent(), &good), 0);
+    }
+
+    /// A coinbase with no transparent bundle has nothing to report. That writes no
+    /// enrichment line and does not touch the forward.
+    #[tokio::test]
+    async fn a_coinbase_with_nothing_to_report_does_not_stop_the_forward() {
+        use sovright_relay::test_support::{committed_header, parseable_transaction, raw_block};
+        let txs = [parseable_transaction(1)];
+        let raw = raw_block(&committed_header(0xcd, &txs), &txs);
+        let harness = harness();
+        let relay = harness.bridge.clone();
+        let mut peer = TestPeer::start_with_relay("no-coinbase", peer_test_config(), relay).await;
+
+        peer.deliver(&raw).await;
+
+        assert_eq!(
+            event_names(&peer, &BLOCK_EVENTS),
+            ["p2p_block_received", "p2p_relay_block_forwarded"]
+        );
+        let forwarded = peer.events("p2p_relay_block_forwarded");
+        assert_eq!(forwarded[0]["mode"], "compact_block");
+    }
+
+    #[tokio::test]
+    async fn without_a_relay_the_coinbase_is_still_reported() {
+        let (good, _) = good_and_bad();
+        let mut peer = TestPeer::start("observe-coinbase", peer_test_config()).await;
+
+        peer.deliver(&good).await;
+
+        assert_eq!(
+            event_names(&peer, &BLOCK_EVENTS),
+            ["p2p_block_received", "p2p_block_coinbase"]
+        );
+        assert!(peer.events("p2p_block_coinbase")[0]["miner_script"].is_string());
+    }
+
+    /// With no relay nothing judges the block, so receiving it is all there is.
+    #[tokio::test]
+    async fn without_a_relay_a_received_block_keeps_its_reward() {
+        let (good, _) = good_and_bad();
+        let mut peer = TestPeer::start("no-relay", scored_config()).await;
+
+        peer.deliver(&good).await;
+
+        assert_eq!(peer.score_reasons(), ["block_received"]);
     }
 
     /// Message level: a real v4 `tx` reaches the tx arm and leaves the cache and
