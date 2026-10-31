@@ -370,7 +370,12 @@ pub async fn run_peer(
                     }
                 } else {
                     let coinbase = coinbase_telemetry_off_workers(&msg.payload).await;
-                    events.p2p_block_coinbase(&peer, &display, &consensus_hash, &coinbase)?;
+                    events.p2p_block_coinbase_unverified(
+                        &peer,
+                        &display,
+                        &consensus_hash,
+                        &coinbase,
+                    )?;
                     crawler.score_peer(
                         peer_addr,
                         config.peer_score_block_received,
@@ -1697,17 +1702,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_a_relay_the_coinbase_is_still_reported() {
-        let (good, _) = good_and_bad();
+    async fn without_a_relay_coinbase_observations_are_not_reported_as_validated() {
+        let (good, bad) = good_and_bad();
         let mut peer = TestPeer::start("observe-coinbase", peer_test_config()).await;
 
         peer.deliver(&good).await;
+        peer.deliver(&bad).await;
 
-        assert_eq!(
-            event_names(&peer, &BLOCK_EVENTS),
-            ["p2p_block_received", "p2p_block_coinbase"]
+        assert!(peer.events("p2p_block_coinbase").is_empty());
+        let observations = peer.events("p2p_block_coinbase_unverified");
+        assert_eq!(observations.len(), 2);
+        assert!(
+            observations
+                .iter()
+                .all(|line| line["miner_script"].is_string())
         );
-        assert!(peer.events("p2p_block_coinbase")[0]["miner_script"].is_string());
+        assert_eq!(
+            observations[0]["consensus_hash"],
+            observations[1]["consensus_hash"]
+        );
     }
 
     /// With no relay nothing judges the block, so receiving it is all there is.

@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use sovright_relay::{
     BlockBodyError, BlockChunker, BlockSender, ClientConfig, CompactBlock, EquihashPowValidator,
     MAX_BLOCK_BYTES, MAX_PAYLOAD_SIZE, PowResult, PowValidator, RawBlockSegment, RelayClient,
@@ -79,7 +80,7 @@ struct UnverifiedForwards {
     capacity: usize,
     window: Duration,
     per_header: usize,
-    entries: VecDeque<(UnverifiedBody, std::time::Instant)>,
+    entries: VecDeque<(UnverifiedBody, std::time::Instant, bool)>,
 }
 
 /// What a body found when it asked to be forwarded unverified.
@@ -110,32 +111,42 @@ impl UnverifiedForwards {
     }
 
     fn reserve(&mut self, body: UnverifiedBody, now: std::time::Instant) -> UnverifiedReservation {
-        while let Some((_, sent_at)) = self.entries.front() {
-            if now.duration_since(*sent_at) <= self.window {
-                break;
-            }
-            self.entries.pop_front();
-        }
-        if self.entries.iter().any(|(entry, _)| *entry == body) {
+        // Never expire an in-flight reservation: its drop guard still owns it.
+        self.entries
+            .retain(|(_, at, sent)| !*sent || now.duration_since(*at) <= self.window);
+        if self.entries.iter().any(|(entry, _, _)| *entry == body) {
             return UnverifiedReservation::Repeat;
         }
         let same_header = self
             .entries
             .iter()
-            .filter(|(entry, _)| entry.header_hash == body.header_hash)
+            .filter(|(entry, _, _)| entry.header_hash == body.header_hash)
             .count();
         if same_header >= self.per_header {
             return UnverifiedReservation::HeaderFull;
         }
         if self.entries.len() >= self.capacity.max(self.per_header) {
-            self.entries.pop_front();
+            return UnverifiedReservation::HeaderFull;
         }
-        self.entries.push_back((body, now));
+        self.entries.push_back((body, now, false));
         UnverifiedReservation::Reserved
     }
 
+    fn sent(&self, body: &UnverifiedBody) -> bool {
+        self.entries
+            .iter()
+            .any(|(entry, at, sent)| *entry == *body && *sent && at.elapsed() <= self.window)
+    }
+
+    fn commit(&mut self, body: &UnverifiedBody) {
+        if let Some((_, at, sent)) = self.entries.iter_mut().find(|(entry, _, _)| entry == body) {
+            *at = std::time::Instant::now();
+            *sent = true;
+        }
+    }
+
     fn release(&mut self, body: &UnverifiedBody) {
-        self.entries.retain(|(entry, _)| entry != body);
+        self.entries.retain(|(entry, _, _)| entry != body);
     }
 }
 
@@ -149,6 +160,10 @@ struct UnverifiedSlot {
 
 impl UnverifiedSlot {
     fn commit(mut self) {
+        self.forwards
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .commit(&self.body);
         self.sent = true;
     }
 }
@@ -273,6 +288,7 @@ struct PreparedForward {
 }
 
 enum PreparedObjects {
+    PreviouslySent,
     /// The compact block does not fit the current FEC budget.
     RawSegments(Vec<RawBlockSegment>),
     Compact {
@@ -286,6 +302,7 @@ enum PreparedObjects {
     Unverified {
         segments: Vec<RawBlockSegment>,
         error: BlockBodyError,
+        slot: UnverifiedSlot,
     },
 }
 
@@ -594,36 +611,34 @@ impl RelayBridge {
             }
         };
 
-        if let PreparedObjects::Unverified { segments, error } = &prepared.objects {
-            let body = UnverifiedBody {
-                header_hash,
-                digest: segments[0].raw_block_digest,
-            };
-            let error = *error;
-            let now = std::time::Instant::now();
-            let reservation = self
-                .unverified_forwards
-                .lock()
-                .expect("unverified_forwards mutex poisoned")
-                .reserve(body, now);
-            match reservation {
-                UnverifiedReservation::Repeat => return Ok(deduplicated()),
-                UnverifiedReservation::HeaderFull => {
-                    return Err(IngressError::InvalidBlockBody(error));
-                }
-                UnverifiedReservation::Reserved => {}
+        let prepared = match prepared {
+            PreparedForward {
+                objects: PreparedObjects::PreviouslySent,
+                ..
+            } => return Ok(deduplicated()),
+            PreparedForward {
+                tx_count,
+                objects:
+                    PreparedObjects::Unverified {
+                        segments,
+                        error,
+                        slot,
+                    },
+            } => {
+                drop(permit);
+                let raw_wire_bytes = self.raw_segments_wire_bytes(&segments);
+                let relay_objects = self.send_raw_block_segments(&segments).await?;
+                slot.commit();
+                self.log_unverified_forward(header, &error, block_payload.len());
+                return Ok(ForwardedBlock {
+                    tx_count,
+                    bytes: raw_wire_bytes,
+                    relay_objects,
+                    mode: ForwardMode::RawBlockSegmentsUnverified,
+                });
             }
-            let slot = UnverifiedSlot {
-                forwards: Arc::clone(&self.unverified_forwards),
-                body,
-                sent: false,
-            };
-            drop(permit);
-            let forwarded = self.send_prepared(prepared).await?;
-            slot.commit();
-            self.log_unverified_forward(header, &error, block_payload.len());
-            return Ok(forwarded);
-        }
+            other => other,
+        };
 
         // Only a validated body claims the block, and a copy that lost the race
         // keeps what it prepared until the winner's send has really gone out. The
@@ -764,6 +779,25 @@ impl RelayBridge {
         block: Vec<u8>,
         tx_cache: Option<&TxCache>,
     ) -> Result<PreparedForward> {
+        // Hash on the bounded blocking pool, not a Tokio worker. A committed
+        // identical body may be skipped; in-flight copies are never treated as sent.
+        if self.forward_unreadable_blocks {
+            let body = UnverifiedBody {
+                header_hash: zcash_block_hash(&block[..ZCASH_FULL_HEADER_SIZE]),
+                digest: Sha256::digest(&block).into(),
+            };
+            if self
+                .unverified_forwards
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .sent(&body)
+            {
+                return Ok(PreparedForward {
+                    tx_count: declared_tx_count(&block),
+                    objects: PreparedObjects::PreviouslySent,
+                });
+            }
+        }
         // Copied only under the bypass, the one case that needs the bytes after the
         // reader has failed.
         let fallback = self.forward_unreadable_blocks.then(|| block.clone());
@@ -863,19 +897,46 @@ impl RelayBridge {
             return Err(refused);
         };
         let header = &block[..ZCASH_FULL_HEADER_SIZE];
+        // Reserve only after parsing has established an unreadable body. Doing it
+        // before parsing could hide a valid body sharing this header.
+        let body = UnverifiedBody {
+            header_hash: zcash_block_hash(header),
+            digest: Sha256::digest(&block).into(),
+        };
+        let reservation = self
+            .unverified_forwards
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reserve(body, std::time::Instant::now());
+        match reservation {
+            UnverifiedReservation::Reserved => {}
+            UnverifiedReservation::Repeat | UnverifiedReservation::HeaderFull => {
+                return Err(refused);
+            }
+        }
+        let slot = UnverifiedSlot {
+            forwards: Arc::clone(&self.unverified_forwards),
+            body,
+            sent: false,
+        };
         if EquihashPowValidator.validate(header) != PowResult::Valid {
             return Err(refused);
         }
         let segments = self.raw_block_segments(zcash_block_hash(header), &block)?;
         Ok(PreparedForward {
             tx_count: declared_tx_count(&block),
-            objects: PreparedObjects::Unverified { segments, error },
+            objects: PreparedObjects::Unverified {
+                segments,
+                error,
+                slot,
+            },
         })
     }
 
     async fn send_prepared(&self, prepared: PreparedForward) -> Result<ForwardedBlock> {
         let PreparedForward { tx_count, objects } = prepared;
         let (compact_wire_bytes, raw_fallback) = match objects {
+            PreparedObjects::PreviouslySent => unreachable!("dedup handled before sending"),
             PreparedObjects::Unverified { segments, .. } => {
                 let raw_wire_bytes = self.raw_segments_wire_bytes(&segments);
                 let relay_objects = self.send_raw_block_segments(&segments).await?;
@@ -1902,6 +1963,31 @@ mod tests {
         let forwards = bridge.unverified_forwards.lock().unwrap();
         assert_eq!(forwards.per_header, 7);
         assert_eq!(forwards.window, Duration::from_secs(11));
+    }
+
+    #[tokio::test]
+    async fn sent_unreadable_repeat_skips_block_preparation() {
+        let mut config = test_config();
+        config.relay_forward_unreadable_blocks = true;
+        let bridge = RelayBridge::from_config(&config, test_events())
+            .await
+            .unwrap()
+            .unwrap();
+        let raw = super::block_body_tests::unreadable_block(40_000, 1);
+        let body = UnverifiedBody {
+            header_hash: zcash_block_hash(&raw[..ZCASH_FULL_HEADER_SIZE]),
+            digest: Sha256::digest(&raw).into(),
+        };
+        {
+            let mut forwards = bridge.unverified_forwards.lock().unwrap();
+            assert!(matches!(
+                forwards.reserve(body, std::time::Instant::now()),
+                UnverifiedReservation::Reserved
+            ));
+            forwards.commit(&body);
+        }
+        let prepared = bridge.prepare_forward(raw, None).unwrap();
+        assert!(matches!(prepared.objects, PreparedObjects::PreviouslySent));
     }
 
     /// The gateway checks the target itself, on any network this runs on.

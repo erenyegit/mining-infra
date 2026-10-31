@@ -1486,6 +1486,8 @@ fn the_budget_refreshes_when_the_window_ends_and_not_before() {
         forwards.reserve(body(2), start),
         UnverifiedReservation::Reserved
     ));
+    forwards.commit(&body(1));
+    forwards.commit(&body(2));
 
     assert!(matches!(
         forwards.reserve(body(3), start + window),
@@ -1493,6 +1495,79 @@ fn the_budget_refreshes_when_the_window_ends_and_not_before() {
     ));
     assert!(matches!(
         forwards.reserve(body(3), start + window + Duration::from_millis(1)),
+        UnverifiedReservation::Reserved
+    ));
+}
+
+#[test]
+fn in_flight_reservations_survive_expiry_and_capacity_pressure_until_cancelled() {
+    let now = std::time::Instant::now();
+    let state = Arc::new(std::sync::Mutex::new(UnverifiedForwards::new(
+        1,
+        Duration::from_secs(1),
+        1,
+    )));
+    let first = UnverifiedBody {
+        header_hash: [1; 32],
+        digest: [2; 32],
+    };
+    let other = UnverifiedBody {
+        header_hash: [3; 32],
+        digest: [4; 32],
+    };
+    assert!(matches!(
+        state.lock().unwrap().reserve(first, now),
+        UnverifiedReservation::Reserved
+    ));
+    let guard = UnverifiedSlot {
+        forwards: Arc::clone(&state),
+        body: first,
+        sent: false,
+    };
+    let later = now + Duration::from_secs(2);
+    assert!(matches!(
+        state.lock().unwrap().reserve(first, later),
+        UnverifiedReservation::Repeat
+    ));
+    assert!(matches!(
+        state.lock().unwrap().reserve(other, later),
+        UnverifiedReservation::HeaderFull
+    ));
+    drop(guard);
+    assert!(matches!(
+        state.lock().unwrap().reserve(other, later),
+        UnverifiedReservation::Reserved
+    ));
+}
+
+#[test]
+fn full_budget_preserves_sent_entries_until_window_expiry() {
+    let start = std::time::Instant::now();
+    let window = Duration::from_secs(1);
+    let mut forwards = UnverifiedForwards::new(1, window, 1);
+    let first = UnverifiedBody {
+        header_hash: [1; 32],
+        digest: [2; 32],
+    };
+    let other = UnverifiedBody {
+        header_hash: [3; 32],
+        digest: [4; 32],
+    };
+    assert!(matches!(
+        forwards.reserve(first, start),
+        UnverifiedReservation::Reserved
+    ));
+    forwards.commit(&first);
+    assert!(matches!(
+        forwards.reserve(other, start + window),
+        UnverifiedReservation::HeaderFull
+    ));
+    assert!(matches!(
+        forwards.reserve(first, start + window),
+        UnverifiedReservation::Repeat
+    ));
+    assert!(matches!(
+        forwards.reserve(other, start + window + Duration::from_millis(50)),
         UnverifiedReservation::Reserved
     ));
 }

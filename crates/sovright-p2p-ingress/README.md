@@ -52,8 +52,9 @@ pair of `miner_script` and `miner_tag` are duplicates. Different pairs under one
 `consensus_hash` are a conflict, and a consumer must report no miner rather than pick
 one, because one hash does not mean one body. See
 [Block attribution](../../docs/integration/block-attribution.md) for the rule, the
-migration order and sample data. Without a bridge every delivery is read, so a block
-has one line per delivery.
+migration order and sample data. Without a bridge, the first transaction is read
+without validating the body against the header. Any extracted fields are emitted
+as `p2p_block_coinbase_unverified`, not as validated attribution.
 
 The FORGE bridge is disabled unless both `SOVRIGHT_P2P_RELAY_PEERS` and
 `SOVRIGHT_P2P_RELAY_AUTH_KEY_HEX` are configured.
@@ -158,8 +159,16 @@ place at ingress.
 | Limits | Different bodies per header | Zebra attempts per block |
 | Setting | `SOVRIGHT_P2P_RELAY_UNREADABLE_BODIES_PER_HEADER` | `unreadable_attempts_per_block`, under `[submit_gate]` |
 | Default | 4, at least 1 | 4 |
-| Refreshes | Each entry `SOVRIGHT_P2P_RELAY_FORWARD_DEDUP_WINDOW_SECS` (30) after it was taken, or at once if its send failed or was cancelled. The list holds `SOVRIGHT_P2P_RELAY_FORWARD_DEDUP_CAPACITY` (64) entries, oldest out first | Each attempt `dedup_window_secs` (300) after it was made, whatever Zebra answered. The list holds `dedup_capacity` (256) entries, oldest out first |
+| Refreshes | Each sent entry expires `SOVRIGHT_P2P_RELAY_FORWARD_DEDUP_WINDOW_SECS` (30) after send; a failed or cancelled attempt is released. The list holds the larger of `SOVRIGHT_P2P_RELAY_FORWARD_DEDUP_CAPACITY` (64) and the per-header limit, and refuses new unreadable bodies when full until an entry expires. In-flight entries never expire or get evicted | Each attempt `dedup_window_secs` (300) after it was made, whatever Zebra answered. The list holds `dedup_capacity` (256) entries, oldest out first |
 | When used up | Refused as `transaction` | `unverified_limit` in `submit_gate_rejected_total` |
+
+Ingress hashes a body on its bounded blocking pool before parsing. A previously sent
+identical unreadable body skips parsing, Equihash and segmentation. A different body
+must still be parsed before the unreadable-body budget applies: rejecting it by header
+alone could suppress a valid copy. Thus this budget does not bound that parsing work.
+An identical copy arriving while a send is in flight can be refused; if the send fails,
+only a subsequent delivery retries it. A full global table can temporarily block new
+unreadable bodies across headers; strictly validated blocks remain outside this budget.
 
 A sidecar's budget is shared by every sender. Raising a budget buys room at the cost
 of more unchecked work: at ingress one raw send of up to 2 MB per body, at the sidecar

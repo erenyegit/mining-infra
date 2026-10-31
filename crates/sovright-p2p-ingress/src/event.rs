@@ -311,11 +311,39 @@ impl EventSink {
         consensus_hash: &str,
         coinbase: &CoinbaseTelemetry,
     ) -> Result<()> {
+        self.write_coinbase_event("p2p_block_coinbase", peer, hash, consensus_hash, coinbase)
+    }
+
+    /// Coinbase observed without validating that the body matches the header.
+    pub fn p2p_block_coinbase_unverified(
+        &self,
+        peer: &str,
+        hash: &str,
+        consensus_hash: &str,
+        coinbase: &CoinbaseTelemetry,
+    ) -> Result<()> {
+        self.write_coinbase_event(
+            "p2p_block_coinbase_unverified",
+            peer,
+            hash,
+            consensus_hash,
+            coinbase,
+        )
+    }
+
+    fn write_coinbase_event(
+        &self,
+        event: &str,
+        peer: &str,
+        hash: &str,
+        consensus_hash: &str,
+        coinbase: &CoinbaseTelemetry,
+    ) -> Result<()> {
         if coinbase.is_empty() {
             return Ok(());
         }
         let mut value = json!({
-            "event": "p2p_block_coinbase",
+            "event": event,
             "peer": peer,
             "hash": hash,
             "consensus_hash": consensus_hash,
