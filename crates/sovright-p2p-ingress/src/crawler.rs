@@ -519,6 +519,8 @@ mod tests {
             relay_compact_from_tx_cache: false,
             relay_skeleton_first: false,
             relay_raw_fallback_with_tx_cache: false,
+            relay_forward_unreadable_blocks: false,
+            relay_unreadable_bodies_per_header: crate::config::DEFAULT_UNREADABLE_BODIES_PER_HEADER,
             relay_raw_segment_send_rounds: 1,
             relay_raw_segment_round_delay_millis: 0,
             relay_forward_dedup_window: Duration::from_secs(30),

@@ -5,7 +5,7 @@
 use std::fmt::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use sovright_relay::BlockBodyError;
@@ -17,17 +17,31 @@ use tracing::warn;
 pub const METRICS_WRITE_INTERVAL: Duration = Duration::from_secs(30);
 
 const BLOCK_BODY_REJECTED: &str = "sovright_p2p_ingress_block_body_rejected_total";
+const UNVERIFIED_FORWARDED: &str = "sovright_p2p_ingress_block_body_unverified_forwarded_total";
+const UNVERIFIED_FORWARD_ENABLED: &str = "sovright_p2p_ingress_unreadable_block_forward_enabled";
 
 /// Block bodies refused at ingress, by reason. Counting is one atomic add, so a
 /// burst of refusals does no file work: the file has its own schedule.
 #[derive(Debug, Default)]
 pub struct BlockBodyRejections {
     counts: [AtomicU64; BlockBodyError::ALL.len()],
+    unverified_forwards: AtomicU64,
+    unverified_forward_enabled: AtomicBool,
 }
 
 impl BlockBodyRejections {
     pub fn record(&self, error: &BlockBodyError) {
         self.counts[error.kind_index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One body sent on without the Merkle and duplicate checks.
+    pub fn record_unverified_forward(&self) {
+        self.unverified_forwards.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_unverified_forward_enabled(&self) {
+        self.unverified_forward_enabled
+            .store(true, Ordering::Relaxed);
     }
 
     fn render(&self) -> String {
@@ -41,6 +55,18 @@ impl BlockBodyRejections {
             writeln!(text, "{BLOCK_BODY_REJECTED}{{reason=\"{label}\"}} {count}")
                 .expect("writing to a String cannot fail");
         }
+        let unverified = self.unverified_forwards.load(Ordering::Relaxed);
+        let enabled = u8::from(self.unverified_forward_enabled.load(Ordering::Relaxed));
+        write!(
+            text,
+            "# HELP {UNVERIFIED_FORWARDED} Bodies forwarded without the Merkle and duplicate checks.\n\
+             # TYPE {UNVERIFIED_FORWARDED} counter\n\
+             {UNVERIFIED_FORWARDED} {unverified}\n\
+             # HELP {UNVERIFIED_FORWARD_ENABLED} 1 while the emergency bypass is on.\n\
+             # TYPE {UNVERIFIED_FORWARD_ENABLED} gauge\n\
+             {UNVERIFIED_FORWARD_ENABLED} {enabled}\n"
+        )
+        .expect("writing to a String cannot fail");
         text
     }
 }
@@ -83,6 +109,10 @@ impl BlockBodyRejections {
             .expect("a known label");
         self.counts[index].load(Ordering::Relaxed)
     }
+
+    pub fn unverified_forwards(&self) -> u64 {
+        self.unverified_forwards.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -93,7 +123,10 @@ mod tests {
     #[test]
     fn every_reason_is_rendered_and_is_the_only_label() {
         let text = BlockBodyRejections::default().render();
-        let series: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
+        let series: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with(BLOCK_BODY_REJECTED))
+            .collect();
         let expected: Vec<String> = BlockBodyError::ALL
             .iter()
             .map(|kind| format!("{BLOCK_BODY_REJECTED}{{reason=\"{}\"}} 0", kind.label()))
@@ -154,5 +187,29 @@ mod tests {
         shows(format!("{BLOCK_BODY_REJECTED}{{reason=\"too_large\"}} 1\n")).await;
 
         let _ = fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod bypass_tests {
+    use super::*;
+
+    #[test]
+    fn the_bypass_has_its_own_counter_and_shows_when_it_is_on() {
+        let rejections = BlockBodyRejections::default();
+        assert!(
+            rejections
+                .render()
+                .contains(&format!("{UNVERIFIED_FORWARD_ENABLED} 0\n"))
+        );
+
+        rejections.set_unverified_forward_enabled();
+        rejections.record_unverified_forward();
+        let text = rejections.render();
+
+        assert!(text.contains(&format!("{UNVERIFIED_FORWARDED} 1\n")));
+        assert!(text.contains(&format!("# TYPE {UNVERIFIED_FORWARDED} counter\n")));
+        assert!(text.contains(&format!("{UNVERIFIED_FORWARD_ENABLED} 1\n")));
+        assert!(text.contains(&format!("# TYPE {UNVERIFIED_FORWARD_ENABLED} gauge\n")));
     }
 }

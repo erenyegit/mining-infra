@@ -48,7 +48,8 @@ pub use transport::{
     AuthKey, BlockAssembly, BlockChunker, CHUNK_MAGIC, Chunk, ChunkHeader, ClientConfig,
     EQUIHASH_K, EQUIHASH_N, EQUIHASH_SOLUTION_SIZE, EquihashPowValidator, KeyRole,
     MAX_PAYLOAD_SIZE, MessageType, PowResult, PowValidator, RejectAllValidator, RelayConfig,
-    RelaySession, StubPowValidator, TransportError, ZCASH_FULL_HEADER_SIZE, ZCASH_HEADER_SIZE,
+    RelaySession, StubPowValidator, TargetCheck, TransportError, ZCASH_FULL_HEADER_SIZE,
+    ZCASH_HEADER_SIZE, header_meets_stated_target,
 };
 pub use tx_feed::{TxFeedError, TxFeedRecord};
 pub use types::{AuthDigest, BlockHash, ShortId, TxId, WtxId};

@@ -305,6 +305,7 @@ fn enabled_gate_config() -> GateConfig {
         allowed_below: 3,
         dedup_window: std::time::Duration::from_secs(60),
         dedup_capacity: 8,
+        unreadable_attempts_per_block: 4,
     }
 }
 
@@ -652,8 +653,8 @@ fn no_submit_path_classifies_by_hand() {
     assert_eq!(
         src.matches("classify_submitblock_outcome(result, submitter")
             .count(),
-        4,
-        "expected all four submit_block call sites to use the shared classifier"
+        5,
+        "expected all five submit_block call sites to use the shared classifier"
     );
 }
 

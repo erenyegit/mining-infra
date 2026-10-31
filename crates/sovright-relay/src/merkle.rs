@@ -156,6 +156,10 @@ pub enum BlockBodyError {
     TooLarge { bytes: usize },
     #[error("block header has the wrong length")]
     InvalidHeaderLength,
+    /// The header misses the target it states. Only ingress's peer path reports
+    /// this, before any parsing; the validators here never do.
+    #[error("block header misses the target it states")]
+    HeaderTarget,
     #[error("invalid transaction count")]
     InvalidCount,
     #[error("block has no transactions")]
@@ -174,9 +178,10 @@ pub enum BlockBodyError {
 
 impl BlockBodyError {
     /// One error of each kind, in metric order. Fields are placeholders.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::TooLarge { bytes: 0 },
         Self::InvalidHeaderLength,
+        Self::HeaderTarget,
         Self::InvalidCount,
         Self::EmptyTransactions,
         Self::Transaction { index: 0 },
@@ -191,6 +196,7 @@ impl BlockBodyError {
         match self {
             Self::TooLarge { .. } => "too_large",
             Self::InvalidHeaderLength => "invalid_header_length",
+            Self::HeaderTarget => "header_target",
             Self::InvalidCount => "invalid_count",
             Self::EmptyTransactions => "empty_transactions",
             Self::Transaction { .. } => "transaction",
@@ -299,17 +305,26 @@ fn read_checked(raw_block: &[u8]) -> Result<(Vec<Range<usize>>, Transaction), Bl
     let mut coinbase = None;
     for index in 0..count as usize {
         let start = ZCASH_FULL_HEADER_SIZE + cursor.position() as usize;
-        let tx = Transaction::read(&mut cursor, TX_READER_BRANCH_HINT)
-            .map_err(|_| BlockBodyError::Transaction { index })?;
+        let Ok(tx) = Transaction::read(&mut cursor, TX_READER_BRANCH_HINT) else {
+            // `Transaction` means nothing is known against the body, which is what
+            // the emergency bypass relies on, so a repeat already read comes first.
+            return Err(match first_repeated_txid(&txids) {
+                Some(index) => BlockBodyError::DuplicateTxid { index },
+                None => BlockBodyError::Transaction { index },
+            });
+        };
         boundaries.push(start..ZCASH_FULL_HEADER_SIZE + cursor.position() as usize);
         txids.push(*tx.txid().as_ref());
         coinbase.get_or_insert(tx);
     }
+    // Before the trailing check, so `TrailingBytes` means the header's transactions
+    // were all read and only the extra bytes are unexplained. A body that does not
+    // match its header is reported as that, whatever follows it.
+    check_txids(header, &txids)?;
     let trailing = body.len() - cursor.position() as usize;
     if trailing != 0 {
         return Err(BlockBodyError::TrailingBytes { bytes: trailing });
     }
-    check_txids(header, &txids)?;
     let coinbase = coinbase.ok_or(BlockBodyError::EmptyTransactions)?;
     Ok((boundaries, coinbase))
 }
@@ -856,6 +871,58 @@ mod body_tests {
         );
     }
 
+    /// `TrailingBytes` is the reason a valid block in an unknown layout can give,
+    /// so it must not cover a body that does not match its header.
+    #[test]
+    fn trailing_bytes_do_not_hide_a_body_that_misses_its_header() {
+        let (_, _, mut raw) = real_block();
+        raw.push(0);
+        raw[MERKLE_ROOT_RANGE.start] ^= 1;
+
+        assert_eq!(
+            validate_block_body(&raw),
+            Err(BlockBodyError::MerkleMismatch)
+        );
+    }
+
+    /// `Transaction` must mean nothing is known against the body, because the
+    /// emergency bypass relies on it. A repeat already read is known.
+    #[test]
+    fn a_repeat_read_before_an_unreadable_transaction_is_reported() {
+        let (header, txs, _) = real_block();
+        let unreadable = vec![0xff; 40];
+        let repeated = [
+            txs[0].clone(),
+            txs[1].clone(),
+            txs[1].clone(),
+            unreadable.clone(),
+        ];
+        let distinct = [txs[0].clone(), txs[1].clone(), unreadable];
+
+        assert_eq!(
+            validate_block_body(&raw_block(&header, &repeated)),
+            Err(BlockBodyError::DuplicateTxid { index: 2 })
+        );
+        assert_eq!(
+            validate_block_body(&raw_block(&header, &distinct)),
+            Err(BlockBodyError::Transaction { index: 2 })
+        );
+    }
+
+    #[test]
+    fn trailing_bytes_do_not_hide_a_repeated_txid() {
+        let (header, txs, _) = real_block();
+        let mut repeated = txs.clone();
+        repeated.push(txs[6].clone());
+        let mut raw = raw_block(&header, &repeated);
+        raw.push(0);
+
+        assert_eq!(
+            validate_block_body(&raw),
+            Err(BlockBodyError::DuplicateTxid { index: 7 })
+        );
+    }
+
     /// A stride, the lengths around the end, and both sides of each edge the
     /// parser turns on: parsing each of the 36,000 prefixes takes minutes in a
     /// debug build.
@@ -905,9 +972,7 @@ mod body_tests {
         );
         assert_eq!(
             validate_block_body(&with_count(6, &txs)),
-            Err(BlockBodyError::TrailingBytes {
-                bytes: txs[6].len()
-            })
+            Err(BlockBodyError::MerkleMismatch)
         );
         assert_eq!(
             validate_block_body(&with_count(0, &[])),
@@ -1079,6 +1144,7 @@ mod body_tests {
         let expected = |error: &BlockBodyError| match error {
             TooLarge { .. } => "too_large",
             InvalidHeaderLength => "invalid_header_length",
+            HeaderTarget => "header_target",
             InvalidCount => "invalid_count",
             EmptyTransactions => "empty_transactions",
             Transaction { .. } => "transaction",
@@ -1087,7 +1153,7 @@ mod body_tests {
             DuplicateTxid { .. } => "duplicate_txid",
             MerkleMismatch => "merkle_mismatch",
         };
-        assert_eq!(BlockBodyError::ALL.len(), 9);
+        assert_eq!(BlockBodyError::ALL.len(), 10);
         let labels: HashSet<&str> = BlockBodyError::ALL.iter().map(|e| e.label()).collect();
         assert_eq!(labels.len(), BlockBodyError::ALL.len());
         for (position, kind) in BlockBodyError::ALL.iter().enumerate() {

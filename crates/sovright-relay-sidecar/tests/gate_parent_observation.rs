@@ -202,6 +202,7 @@ fn gate_over(view: &Arc<ZebraChainView>) -> SubmitGate<Arc<ZebraChainView>> {
             allowed_below: 3,
             dedup_window: Duration::from_secs(60),
             dedup_capacity: 8,
+            unreadable_attempts_per_block: 4,
         },
         Arc::clone(view),
     )

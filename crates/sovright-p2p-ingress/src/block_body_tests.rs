@@ -5,14 +5,17 @@
 use super::nu7_fixture::{Nu7Fixture, tx_cache};
 use super::*;
 use crate::block::{compact_block_from_raw_block, reconstruct_block};
+use crate::event::EventSink;
+use crate::wire::Network;
 use sovright_relay::test_support::{committed_header, raw_block};
 use sovright_relay::{
-    BlockBodyError, RelayPayload, ZCASH_FULL_HEADER_SIZE, reassemble_raw_block,
-    validate_block_body, validate_block_transactions, zcash_block_hash,
+    BlockBodyError, RelayPayload, ZCASH_FULL_HEADER_SIZE, consensus_block_hash,
+    reassemble_raw_block, validate_block_body, validate_block_transactions, zcash_block_hash,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use zcash_pool_common::fixtures;
+use zcash_equihash_validator::compact_to_target;
+use zcash_pool_common::{BITS_OFFSET, fixtures};
 
 pub(crate) struct Harness {
     pub(crate) bridge: RelayBridge,
@@ -44,6 +47,10 @@ pub(crate) fn harness() -> Harness {
         ))),
         parse_permits: ParsePermits::new(),
         block_body_rejections: Default::default(),
+        peer_pow_limit: None,
+        block_log: None,
+        forward_unreadable_blocks: false,
+        unverified_forwards: Default::default(),
     };
     Harness {
         bridge,
@@ -996,4 +1003,583 @@ async fn a_panic_in_the_work_releases_the_permit() {
 
     assert!(result.unwrap_err().is_panic());
     assert_eq!(permits.available_permits(), 1);
+}
+
+/// A bridge with the peer target check on, as `from_config` builds it. The other
+/// harnesses leave it off because their synthetic headers would all miss.
+pub(crate) fn checked_harness(network: Network) -> Harness {
+    let mut harness = harness();
+    harness.bridge.peer_pow_limit = Some(network.pow_limit());
+    harness
+}
+
+/// `header` followed by a body the reader refuses. A refusal with
+/// `Transaction { index: 0 }` shows the block got past the target check.
+pub(crate) fn unreadable_body(header: &[u8]) -> Vec<u8> {
+    let mut raw = header.to_vec();
+    raw.push(1);
+    raw.extend_from_slice(&[0xff; 40]);
+    raw
+}
+
+/// A real header with its target made impossible for its hash to meet.
+pub(crate) fn header_missing_its_target() -> Vec<u8> {
+    let mut header = fixtures::mainnet_serialized_header();
+    header[BITS_OFFSET..][..4].copy_from_slice(&0x0300_0001u32.to_le_bytes());
+    header
+}
+
+/// A made-up header stating `bits` and ground until its hash meets them. Its
+/// solution does not verify, which is why meeting the target is not proof of work.
+pub(crate) fn header_stating(bits: u32) -> Vec<u8> {
+    let target = compact_to_target(bits);
+    let mut header = fixtures::mainnet_serialized_header();
+    header[BITS_OFFSET..][..4].copy_from_slice(&bits.to_le_bytes());
+    for nonce in 0u32.. {
+        header[108..112].copy_from_slice(&nonce.to_le_bytes());
+        if target.is_met_by(&consensus_block_hash(&header)) {
+            break;
+        }
+    }
+    header
+}
+
+/// The permit is held throughout, so this finishes only if the header is refused
+/// before one is taken.
+#[tokio::test]
+async fn a_header_missing_its_target_is_refused_without_a_permit() {
+    let mut harness = checked_harness(Network::Mainnet);
+    let _held = hold_p2p_permit(&harness.bridge).await;
+    let out_of_range = vec![0xab; ZCASH_FULL_HEADER_SIZE];
+    for header in [header_missing_its_target(), out_of_range] {
+        let raw = unreadable_body(&header);
+
+        assert_rejected(
+            finishes(harness.bridge.forward_block(&raw, None)).await,
+            BlockBodyError::HeaderTarget,
+        );
+
+        assert!(harness.sent().is_empty());
+        assert!(!harness.recorded(&raw));
+    }
+    let count = |label| harness.bridge.block_body_rejections.count(label);
+    assert_eq!(count("header_target"), 2);
+    assert_eq!(count("transaction"), 0, "nothing was parsed");
+}
+
+/// The block hash is the consensus SHA256d. These are real blocks, so a BLAKE2b
+/// object id in its place would miss their targets.
+#[tokio::test]
+async fn real_blocks_pass_the_target_check_of_their_network() {
+    let mut mainnet = checked_harness(Network::Mainnet);
+    let forwarded = mainnet
+        .bridge
+        .forward_block(&fixtures::mainnet_raw_block(), None)
+        .await
+        .unwrap();
+    assert_eq!(forwarded.mode, ForwardMode::RawBlockSegments);
+
+    let mut testnet = checked_harness(Network::Testnet);
+    let forwarded = testnet
+        .bridge
+        .forward_block(&Nu7Fixture::load().raw, None)
+        .await
+        .unwrap();
+    assert_eq!(forwarded.mode, ForwardMode::CompactBlock);
+
+    assert!(!mainnet.sent().is_empty());
+    assert!(!testnet.sent().is_empty());
+}
+
+/// Testnet's minimum difficulty is out of range on mainnet, so the limit has to
+/// come from the network.
+#[tokio::test]
+async fn a_minimum_difficulty_target_passes_only_on_testnet() {
+    let raw = unreadable_body(&header_stating(0x2007_ffff));
+
+    assert_rejected(
+        checked_harness(Network::Testnet)
+            .bridge
+            .forward_block(&raw, None)
+            .await,
+        BlockBodyError::Transaction { index: 0 },
+    );
+    assert_rejected(
+        checked_harness(Network::Mainnet)
+            .bridge
+            .forward_block(&raw, None)
+            .await,
+        BlockBodyError::HeaderTarget,
+    );
+}
+
+/// The gateway has its own target check ahead of this, so its path is unchanged.
+#[tokio::test]
+async fn the_gateway_path_does_not_apply_the_peer_check() {
+    let harness = checked_harness(Network::Mainnet);
+    let raw = unreadable_body(&header_missing_its_target());
+
+    assert_rejected(
+        harness.bridge.forward_pool_block(&raw, None).await,
+        BlockBodyError::Transaction { index: 0 },
+    );
+}
+
+/// Inside the dedup window a real header costs no parse, whatever follows it.
+#[tokio::test]
+async fn a_known_real_header_with_another_body_costs_no_parse() {
+    let (good, _) = good_and_bad();
+    let mut harness = checked_harness(Network::Testnet);
+    harness.bridge.forward_block(&good, None).await.unwrap();
+    harness.sent();
+
+    let repeat = unreadable_body(&good[..ZCASH_FULL_HEADER_SIZE]);
+    let forwarded = harness.bridge.forward_block(&repeat, None).await.unwrap();
+
+    assert_eq!(forwarded.mode, ForwardMode::Deduplicated);
+    assert_eq!(harness.bridge.block_body_rejections.count("transaction"), 0);
+}
+
+/// The target check does not stop this. A header outside the dedup window passes
+/// it with any body, a refused body is not recorded, and so each delivery of the
+/// same bytes is parsed again.
+#[tokio::test]
+async fn known_gap_a_reused_real_header_is_parsed_on_every_delivery() {
+    let mut harness = checked_harness(Network::Mainnet);
+    let raw = unreadable_body(&fixtures::mainnet_serialized_header());
+
+    for _ in 0..2 {
+        assert_rejected(
+            harness.bridge.forward_block(&raw, None).await,
+            BlockBodyError::Transaction { index: 0 },
+        );
+    }
+
+    assert_eq!(harness.bridge.block_body_rejections.count("transaction"), 2);
+    assert!(harness.sent().is_empty());
+    assert!(!harness.recorded(&raw));
+}
+
+/// A real block plus one byte matches its header, so it costs the sender nothing
+/// and each delivery still costs a full parse.
+#[tokio::test]
+async fn known_gap_a_real_block_with_a_trailing_byte_is_parsed_on_every_delivery() {
+    let harness = checked_harness(Network::Mainnet);
+    let mut raw = fixtures::mainnet_raw_block();
+    raw.push(0);
+
+    for _ in 0..2 {
+        assert_rejected(
+            harness.bridge.forward_block(&raw, None).await,
+            BlockBodyError::TrailingBytes { bytes: 1 },
+        );
+    }
+
+    let count = |label| harness.bridge.block_body_rejections.count(label);
+    assert_eq!(count("trailing_bytes"), 2);
+}
+
+/// The coinbase line is written before the send, and it is telemetry: a log that
+/// cannot be written must not cost the block.
+#[tokio::test]
+async fn a_coinbase_that_cannot_be_written_does_not_stop_the_block() {
+    let (good, _) = good_and_bad();
+    let sink = EventSink::unwritable();
+    assert!(sink.p2p_peer_error("peer", "writes fail").is_err());
+    let mut harness = harness();
+    let bridge = harness.bridge.clone().logging_block_events(sink, "peer");
+
+    let forwarded = bridge.forward_block(&good, None).await.unwrap();
+
+    assert_eq!(forwarded.mode, ForwardMode::CompactBlock);
+    assert!(harness.recorded(&good));
+    assert_eq!(compact_blocks_of(&harness.sent(), &good), 1);
+}
+
+/// A transaction in a layout the reader does not know: its version group is
+/// unassigned. The last byte tells bodies apart.
+pub(crate) fn unknown_layout_transaction(bytes: usize, last: u8) -> Vec<u8> {
+    let mut tx = 0x8000_0007u32.to_le_bytes().to_vec();
+    tx.extend_from_slice(&0x7a7a_7a7au32.to_le_bytes());
+    tx.resize(bytes, 0x5a);
+    tx[bytes - 1] = last;
+    tx
+}
+
+/// A real header with its real proof of work, over a body the reader stops in:
+/// transaction 0 parses, transaction 1 cannot.
+pub(crate) fn unreadable_block(bytes: usize, last: u8) -> Vec<u8> {
+    let coinbase = fixtures::mainnet_transactions().swap_remove(0);
+    raw_block(
+        &fixtures::mainnet_serialized_header(),
+        &[coinbase, unknown_layout_transaction(bytes, last)],
+    )
+}
+
+const UNREADABLE: BlockBodyError = BlockBodyError::Transaction { index: 1 };
+
+/// A bridge as `from_config` builds it with the emergency bypass on.
+pub(crate) fn bypass_harness() -> Harness {
+    let mut harness = checked_harness(Network::Mainnet);
+    harness.bridge.forward_unreadable_blocks = true;
+    harness
+}
+
+fn raw_segments(sent: Vec<RelayPayload>) -> Vec<RawBlockSegment> {
+    sent.into_iter()
+        .map(|payload| match payload {
+            RelayPayload::RawBlockSegment(segment) => segment,
+            other => panic!("expected a raw segment, got {other:?}"),
+        })
+        .collect()
+}
+
+fn unverified_entries(bridge: &RelayBridge) -> usize {
+    bridge.unverified_forwards.lock().unwrap().entries.len()
+}
+
+#[tokio::test]
+async fn without_the_bypass_an_unreadable_body_is_refused() {
+    let raw = unreadable_block(400, 1);
+    let mut harness = checked_harness(Network::Mainnet);
+
+    assert_rejected(harness.bridge.forward_block(&raw, None).await, UNREADABLE);
+
+    assert!(harness.sent().is_empty());
+    assert_eq!(
+        harness.bridge.block_body_rejections.unverified_forwards(),
+        0
+    );
+}
+
+/// Raw only, because nothing else can be built without the transaction boundaries.
+/// It claims nothing: a forged body in this path must not hide the real block.
+#[tokio::test]
+async fn an_unreadable_body_goes_out_raw_and_claims_nothing() {
+    let raw = unreadable_block(400, 1);
+    let mut harness = bypass_harness();
+
+    let forwarded = harness.bridge.forward_block(&raw, None).await.unwrap();
+
+    assert_eq!(forwarded.mode, ForwardMode::RawBlockSegmentsUnverified);
+    assert_eq!(forwarded.mode.as_str(), "raw_block_segments_unverified");
+    let segments = raw_segments(harness.sent());
+    assert_eq!(reassemble_raw_block(&segments).unwrap(), raw);
+    assert!(!harness.recorded(&raw));
+    let rejections = &harness.bridge.block_body_rejections;
+    assert_eq!(rejections.unverified_forwards(), 1);
+    assert_eq!(rejections.count("transaction"), 0, "it was not refused");
+}
+
+/// The bypass covers a body nothing is known against. Each of these is a finding
+/// about the body, and one is a repeat found before the reader stopped.
+#[tokio::test]
+async fn the_bypass_leaves_every_other_refusal_standing() {
+    let header = fixtures::mainnet_serialized_header();
+    let txs = fixtures::mainnet_transactions();
+    let genuine = raw_block(&header, &txs);
+    let mut trailing = genuine.clone();
+    trailing.push(0);
+    let mut changed = txs.clone();
+    changed[3][60] ^= 0x01;
+    let mut repeated = txs.clone();
+    repeated.push(txs[6].clone());
+    let repeat_then_unreadable = [
+        txs[0].clone(),
+        txs[1].clone(),
+        txs[1].clone(),
+        unknown_layout_transaction(400, 1),
+    ];
+    let mut bad_count = header.clone();
+    bad_count.extend_from_slice(&[0xfd, 7, 0]);
+    txs.iter().for_each(|tx| bad_count.extend_from_slice(tx));
+    let cases = [
+        (trailing, BlockBodyError::TrailingBytes { bytes: 1 }),
+        (raw_block(&header, &changed), BlockBodyError::MerkleMismatch),
+        (
+            raw_block(&header, &repeated),
+            BlockBodyError::DuplicateTxid { index: 7 },
+        ),
+        (
+            raw_block(&header, &repeat_then_unreadable),
+            BlockBodyError::DuplicateTxid { index: 2 },
+        ),
+        (bad_count, BlockBodyError::InvalidCount),
+        (
+            vec![0; MAX_BLOCK_BYTES + 1],
+            BlockBodyError::TooLarge {
+                bytes: MAX_BLOCK_BYTES + 1,
+            },
+        ),
+        (vec![0; 10], BlockBodyError::InvalidHeaderLength),
+    ];
+    for (raw, expected) in cases {
+        let mut harness = bypass_harness();
+
+        assert_rejected(harness.bridge.forward_block(&raw, None).await, expected);
+
+        assert!(harness.sent().is_empty(), "{expected:?}");
+        assert_eq!(
+            harness.bridge.block_body_rejections.unverified_forwards(),
+            0
+        );
+    }
+}
+
+/// Meeting the target is cheap, so the bypass also needs a valid solution.
+#[tokio::test]
+async fn a_header_with_no_real_proof_of_work_gets_no_bypass() {
+    let raw = unreadable_body(&header_stating(0x1f07_ffff));
+    let mut harness = bypass_harness();
+
+    assert_rejected(
+        harness.bridge.forward_block(&raw, None).await,
+        BlockBodyError::Transaction { index: 0 },
+    );
+
+    assert!(harness.sent().is_empty());
+    assert_eq!(
+        harness.bridge.block_body_rejections.unverified_forwards(),
+        0
+    );
+}
+
+/// Forged body first, real body second: the real one goes out the usual way.
+#[tokio::test]
+async fn a_valid_copy_after_an_unreadable_one_is_sent_as_usual() {
+    let genuine = fixtures::mainnet_raw_block();
+    let mut harness = bypass_harness();
+    harness
+        .bridge
+        .forward_block(&unreadable_block(400, 1), None)
+        .await
+        .unwrap();
+    harness.sent();
+
+    let forwarded = harness.bridge.forward_block(&genuine, None).await.unwrap();
+
+    assert_eq!(forwarded.mode, ForwardMode::RawBlockSegments);
+    assert_eq!(
+        reassemble_raw_block(&raw_segments(harness.sent())).unwrap(),
+        genuine
+    );
+    assert!(harness.recorded(&genuine));
+}
+
+#[tokio::test]
+async fn a_known_block_stops_an_unreadable_copy_unparsed() {
+    let mut harness = bypass_harness();
+    harness
+        .bridge
+        .forward_block(&fixtures::mainnet_raw_block(), None)
+        .await
+        .unwrap();
+    harness.sent();
+
+    let forwarded = harness
+        .bridge
+        .forward_block(&unreadable_block(400, 1), None)
+        .await
+        .unwrap();
+
+    assert_eq!(forwarded.mode, ForwardMode::Deduplicated);
+    assert!(harness.sent().is_empty());
+    assert_eq!(
+        harness.bridge.block_body_rejections.unverified_forwards(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn the_same_unreadable_bytes_go_out_once() {
+    let raw = unreadable_block(400, 1);
+    let mut harness = bypass_harness();
+    harness.bridge.forward_block(&raw, None).await.unwrap();
+    harness.sent();
+
+    let repeat = harness.bridge.forward_block(&raw, None).await.unwrap();
+
+    assert_eq!(repeat.mode, ForwardMode::Deduplicated);
+    assert!(harness.sent().is_empty());
+    assert_eq!(
+        harness.bridge.block_body_rejections.unverified_forwards(),
+        1
+    );
+}
+
+fn body_budget(bridge: &RelayBridge) -> usize {
+    bridge.unverified_forwards.lock().unwrap().per_header
+}
+
+async fn use_up_body_budget(harness: &mut Harness, bodies: usize) {
+    for body in 0..bodies {
+        let raw = unreadable_block(400, body as u8);
+        let forwarded = harness.bridge.forward_block(&raw, None).await.unwrap();
+        assert_eq!(forwarded.mode, ForwardMode::RawBlockSegmentsUnverified);
+    }
+    harness.sent();
+}
+
+/// Inside the budget a real unreadable body still gets out behind forged ones.
+#[tokio::test]
+async fn the_real_unreadable_body_passes_while_the_budget_lasts() {
+    let mut harness = bypass_harness();
+    let spare = body_budget(&harness.bridge) - 1;
+    use_up_body_budget(&mut harness, spare).await;
+
+    let real = unreadable_block(400, 0xff);
+    let forwarded = harness.bridge.forward_block(&real, None).await.unwrap();
+
+    assert_eq!(forwarded.mode, ForwardMode::RawBlockSegmentsUnverified);
+    assert_eq!(
+        reassemble_raw_block(&raw_segments(harness.sent())).unwrap(),
+        real
+    );
+}
+
+/// The limit stops recovery here. Forged bodies under a real header cost nothing,
+/// so whoever sends them first can use the whole budget and the real unreadable
+/// body is refused until it refreshes. No budget guarantees recovery from that.
+#[tokio::test]
+async fn known_gap_forged_bodies_can_use_up_the_budget_before_the_real_one() {
+    let mut harness = bypass_harness();
+    let budget = body_budget(&harness.bridge);
+    use_up_body_budget(&mut harness, budget).await;
+
+    let real = unreadable_block(400, 0xff);
+    assert_rejected(harness.bridge.forward_block(&real, None).await, UNREADABLE);
+
+    assert!(harness.sent().is_empty());
+    assert_eq!(harness.bridge.block_body_rejections.count("transaction"), 1);
+}
+
+/// The limit is on bodies nothing could check, so a block that validates is outside it.
+#[tokio::test]
+async fn a_used_budget_does_not_touch_a_block_that_validates() {
+    let mut harness = bypass_harness();
+    let budget = body_budget(&harness.bridge);
+    use_up_body_budget(&mut harness, budget).await;
+
+    let forwarded = harness
+        .bridge
+        .forward_block(&fixtures::mainnet_raw_block(), None)
+        .await
+        .unwrap();
+
+    assert_eq!(forwarded.mode, ForwardMode::RawBlockSegments);
+}
+
+#[test]
+fn the_budget_refreshes_when_the_window_ends_and_not_before() {
+    let window = Duration::from_secs(30);
+    let mut forwards = UnverifiedForwards::new(64, window, 2);
+    let body = |digest| UnverifiedBody {
+        header_hash: [1; 32],
+        digest: [digest; 32],
+    };
+    let start = std::time::Instant::now();
+    assert!(matches!(
+        forwards.reserve(body(1), start),
+        UnverifiedReservation::Reserved
+    ));
+    assert!(matches!(
+        forwards.reserve(body(2), start),
+        UnverifiedReservation::Reserved
+    ));
+
+    assert!(matches!(
+        forwards.reserve(body(3), start + window),
+        UnverifiedReservation::HeaderFull
+    ));
+    assert!(matches!(
+        forwards.reserve(body(3), start + window + Duration::from_millis(1)),
+        UnverifiedReservation::Reserved
+    ));
+}
+
+/// The first relay refuses a target above the mainnet range, so a block like this
+/// could not go anywhere. Refusing it here says so rather than counting a forward.
+#[tokio::test]
+async fn the_bypass_refuses_a_testnet_minimum_difficulty_block() {
+    let raw = unreadable_body(&fixtures::testnet_genesis_serialized_header());
+    let mut harness = checked_harness(Network::Testnet);
+    harness.bridge.forward_unreadable_blocks = true;
+
+    assert_rejected(
+        harness.bridge.forward_block(&raw, None).await,
+        BlockBodyError::Transaction { index: 0 },
+    );
+
+    assert!(harness.sent().is_empty());
+    assert_eq!(
+        harness.bridge.block_body_rejections.count("header_target"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn the_bypass_covers_a_testnet_block_in_the_mainnet_target_range() {
+    let raw = unreadable_body(&Nu7Fixture::load().raw[..ZCASH_FULL_HEADER_SIZE]);
+    let mut harness = checked_harness(Network::Testnet);
+    harness.bridge.forward_unreadable_blocks = true;
+
+    let forwarded = harness.bridge.forward_block(&raw, None).await.unwrap();
+
+    assert_eq!(forwarded.mode, ForwardMode::RawBlockSegmentsUnverified);
+    assert_eq!(
+        reassemble_raw_block(&raw_segments(harness.sent())).unwrap(),
+        raw
+    );
+}
+
+#[tokio::test]
+async fn a_failed_unverified_send_gives_its_place_back() {
+    let raw = unreadable_block(400, 1);
+    let Harness {
+        bridge, outgoing, ..
+    } = bypass_harness();
+    drop(outgoing);
+
+    let outcome = bridge.forward_block(&raw, None).await;
+
+    assert!(matches!(outcome, Err(IngressError::Relay(_))));
+    assert_eq!(unverified_entries(&bridge), 0);
+    assert_eq!(bridge.block_body_rejections.unverified_forwards(), 0);
+}
+
+#[tokio::test]
+async fn a_cancelled_unverified_send_gives_its_place_back() {
+    let raw = unreadable_block(400, 1);
+    let harness = bypass_harness();
+    fill_send_channel(&harness.bridge).await;
+    let bridge = harness.bridge.clone();
+    let task = tokio::spawn(async move { bridge.forward_block(&raw, None).await });
+    eventually(|| unverified_entries(&harness.bridge) == 1).await;
+
+    cancel(task).await;
+
+    eventually(|| unverified_entries(&harness.bridge) == 0).await;
+    assert_eq!(
+        harness.bridge.block_body_rejections.unverified_forwards(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn concurrent_copies_of_an_unreadable_body_are_sent_once() {
+    let raw = unreadable_block(400, 1);
+    let mut harness = bypass_harness();
+
+    let (first, second) = tokio::join!(
+        harness.bridge.forward_block(&raw, None),
+        harness.bridge.forward_block(&raw, None),
+    );
+
+    let modes = [first.unwrap().mode, second.unwrap().mode];
+    assert!(modes.contains(&ForwardMode::RawBlockSegmentsUnverified));
+    assert!(modes.contains(&ForwardMode::Deduplicated));
+    assert_eq!(
+        reassemble_raw_block(&raw_segments(harness.sent())).unwrap(),
+        raw
+    );
 }

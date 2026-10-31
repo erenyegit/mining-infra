@@ -105,6 +105,7 @@ fn enabled_gate_config() -> GateConfig {
         allowed_below: 3,
         dedup_window: Duration::from_secs(60),
         dedup_capacity: 8,
+        unreadable_attempts_per_block: 4,
     }
 }
 

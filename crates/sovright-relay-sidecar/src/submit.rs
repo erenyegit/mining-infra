@@ -8,12 +8,14 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use sovright_relay::{
-    BlockBodyError, BlockHash, CompactBlock, CompactBlockReconstructor, GetBlockTxn,
-    MempoolProvider, ReconstructionResult, ShortId, WtxId, ZCASH_FULL_HEADER_SIZE,
-    consensus_block_hash_display, validate_block_body, validate_block_transactions,
-    zcash_block_hash,
+    BlockBodyError, BlockHash, CompactBlock, CompactBlockReconstructor, EquihashPowValidator,
+    GetBlockTxn, MempoolProvider, PowResult, PowValidator, ReconstructionResult, ShortId, WtxId,
+    ZCASH_FULL_HEADER_SIZE, consensus_block_hash_display, validate_block_body,
+    validate_block_transactions, zcash_block_hash,
 };
 
 use crate::rpc::ZebraRpc;
@@ -125,8 +127,12 @@ pub struct SubmissionCandidate {
     /// with ingress receipts and the first-to-Zebra win attribution pipeline.
     pub consensus_block_hash: String,
     pub block_hex: String,
+    /// 0 for an unverified candidate, whose transactions could not all be read.
     pub tx_count: usize,
     pub block_bytes: usize,
+    /// Why this sidecar could not read the body, if it is going to Zebra anyway
+    /// under the emergency bypass. The Merkle and duplicate checks have not run.
+    pub unverified: Option<BlockBodyError>,
 }
 
 /// Outcome from handling one relay-received compact block.
@@ -341,6 +347,7 @@ pub fn build_submission_candidate(
         block_hex: hex::encode(&block),
         tx_count,
         block_bytes: block.len(),
+        unverified: None,
     })
 }
 
@@ -410,6 +417,7 @@ fn build_submission_candidate_from_transactions(
         block_hex: hex::encode(&block),
         tx_count: transactions.len(),
         block_bytes: block.len(),
+        unverified: None,
     })
 }
 
@@ -439,6 +447,32 @@ pub fn build_raw_block_submission_candidate(
         block_hex: hex::encode(raw_block),
         tx_count,
         block_bytes: raw_block.len(),
+        unverified: None,
+    })
+}
+
+/// A raw block this sidecar could not read, for the emergency bypass. Nothing here
+/// says the body belongs to its header, so the header has to show a real proof of
+/// work. The relay's checks are not relied on, and neither is what the sender saw.
+///
+/// The cost of the Equihash check has not been measured. It is the relay node's
+/// check, so it covers the mainnet target range on either network: a testnet
+/// minimum-difficulty block is refused here as it is at the first relay.
+fn unverified_raw_candidate(
+    raw_block: &[u8],
+    error: BlockBodyError,
+) -> Result<SubmissionCandidate, RelayBlockError> {
+    let header = raw_block_header(raw_block)?;
+    if EquihashPowValidator.validate(header) != PowResult::Valid {
+        return Err(RelayBlockError::InvalidBlockBody(error));
+    }
+    Ok(SubmissionCandidate {
+        block_hash: hex::encode(raw_block_header_hash(header)),
+        consensus_block_hash: consensus_block_hash_display(header),
+        block_hex: hex::encode(raw_block),
+        tx_count: 0,
+        block_bytes: raw_block.len(),
+        unverified: Some(error),
     })
 }
 
@@ -702,6 +736,103 @@ where
     }
 }
 
+/// The refusal the emergency bypass may override, if this is one. A transaction that
+/// did not parse is the only one: anything else is a finding about the body.
+pub fn unreadable_body(
+    outcome: &Result<SubmissionOutcome, RelayBlockError>,
+) -> Option<BlockBodyError> {
+    match outcome {
+        Err(RelayBlockError::InvalidBlockBody(error @ BlockBodyError::Transaction { .. })) => {
+            Some(*error)
+        }
+        _ => None,
+    }
+}
+
+/// What bounds one emergency bypass attempt, and where it is counted.
+#[derive(Clone, Copy)]
+pub struct UnverifiedLimits<'a> {
+    /// Time for the attempt's async waits together: the parent lookup, the gate,
+    /// `submitblock` and the lookup after a rejection, so separate RPC timeouts cannot
+    /// add up. It is not a wall-clock limit on the attempt: a timer cannot interrupt
+    /// the synchronous Equihash check, which can run past it.
+    pub budget: Duration,
+    pub bypassed: &'a AtomicU64,
+}
+
+/// The emergency bypass, for a raw block the strict path refused as
+/// [`unreadable_body`]. Zebra is the only validator of these bytes.
+///
+/// The gate lock is held only to reserve an attempt and to record the result, so a
+/// candidate waiting on Zebra holds up nothing else. The block is recorded only once
+/// Zebra has it. A dry run has no verdict, and a rejection, an RPC error, a timeout or
+/// cancellation says nothing about the real body, so none of them may hide it.
+pub async fn submit_unverified_raw_block<S, V, L, F>(
+    submitter: &S,
+    raw_block: &[u8],
+    error: BlockBodyError,
+    mode: SubmitBlockMode,
+    gate: &tokio::sync::Mutex<crate::submit_gate::SubmitGate<V>>,
+    limits: UnverifiedLimits<'_>,
+    look_up_parent: L,
+) -> Result<SubmissionOutcome, RelayBlockError>
+where
+    S: SubmitBlock + Sync,
+    V: crate::submit_gate::ChainView,
+    L: FnOnce() -> F,
+    F: Future<Output = Option<crate::submit_gate::ParentObservation>>,
+{
+    let attempt = async {
+        let candidate = unverified_raw_candidate(raw_block, error)?;
+        let header = raw_block_header(raw_block)?;
+        let parent = look_up_parent().await;
+        let meta = crate::submit_gate::CandidateMeta::from_header_bytes(
+            header,
+            candidate.block_hash.clone(),
+            parent.as_ref(),
+        )
+        .map_err(candidate_meta_error)?;
+
+        let reservation = gate.lock().await.reserve_unverified_now(&candidate, &meta);
+        let slot = match reservation {
+            Ok(slot) => slot,
+            Err(reason) => return Ok(SubmissionOutcome::GateRejected { candidate, reason }),
+        };
+        limits.bypassed.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            consensus_block_hash = %candidate.consensus_block_hash,
+            reason = candidate.unverified.map(|error| error.label()),
+            block_bytes = candidate.block_bytes,
+            checks_run = "size,header,proof_of_work",
+            checks_skipped = "merkle,duplicate_txid",
+            "Sending Zebra a block body without the Merkle and duplicate checks"
+        );
+
+        match mode {
+            SubmitBlockMode::DryRun => Ok(SubmissionOutcome::DryRun(candidate)),
+            SubmitBlockMode::Live => {
+                let result = submitter
+                    .submit_block(&candidate.block_hex)
+                    .await
+                    .map_err(|error| RelayBlockError::SubmitFailed(error.to_string()))?;
+                let hash = &candidate.consensus_block_hash;
+                let status = classify_submitblock_outcome(result, submitter, hash).await?;
+                gate.lock().await.record_submitted_now(&candidate);
+                drop(slot);
+                Ok(SubmissionOutcome::Submitted { candidate, status })
+            }
+        }
+    };
+    tokio::time::timeout(limits.budget, attempt)
+        .await
+        .unwrap_or_else(|_| {
+            Err(RelayBlockError::SubmitFailed(format!(
+                "unverified submission exceeded its {:?} budget",
+                limits.budget
+            )))
+        })
+}
+
 /// A gated candidate whose `CandidateMeta` could not be built never reaches
 /// the gate or `submit_block`; each cause keeps its own reason text.
 fn candidate_meta_error(error: crate::submit_gate::CandidateMetaError) -> RelayBlockError {
@@ -856,6 +987,7 @@ mod tests {
         let candidate = SubmissionCandidate {
             block_hash: "internal-id".to_string(),
             consensus_block_hash: "00abcdef".to_string(),
+            unverified: None,
             block_hex: "00".to_string(),
             tx_count: 1,
             block_bytes: 1,

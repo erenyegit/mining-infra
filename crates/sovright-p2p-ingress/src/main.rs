@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod attribution_tests;
 mod block;
 mod coinbase;
 mod config;
@@ -38,7 +40,7 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
     let events = EventSink::for_network(config.event_log.clone(), config.network)?;
-    let relay = RelayBridge::from_config(&config).await?;
+    let relay = RelayBridge::from_config(&config, events.clone()).await?;
     let tx_cache = config.tx_cache_enabled.then(|| {
         TxCache::new(TxCacheConfig {
             max_entries: config.tx_cache_max_entries,

@@ -169,7 +169,7 @@ fn miner_tag(coinbase: &Transaction) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn coinbase_miner_script(block_payload: &[u8]) -> Option<String> {
@@ -309,7 +309,7 @@ mod tests {
     /// A minimal valid v5 coinbase whose single input carries `script_sig`.
     /// Same shape as `v5_coinbase_two_outputs`, but the input script -- where a
     /// pool stamps its tag -- is caller-supplied instead of fixed filler.
-    fn v5_coinbase_with_script_sig(script_sig: &[u8]) -> Vec<u8> {
+    pub(crate) fn v5_coinbase_with_script_sig(script_sig: &[u8]) -> Vec<u8> {
         let mut tx = Vec::new();
         tx.extend_from_slice(&(OVERWINTERED_FLAG | 5).to_le_bytes());
         tx.extend_from_slice(&TX_V5_VERSION_GROUP_ID.to_le_bytes());

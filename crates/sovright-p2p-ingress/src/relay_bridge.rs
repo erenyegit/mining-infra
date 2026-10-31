@@ -1,24 +1,28 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use sovright_relay::{
-    BlockBodyError, BlockChunker, BlockSender, ClientConfig, CompactBlock, MAX_BLOCK_BYTES,
-    MAX_PAYLOAD_SIZE, RawBlockSegment, RelayClient, TransportError, ZCASH_FULL_HEADER_SIZE,
-    parse_block_body, split_raw_block, zcash_block_hash,
+    BlockBodyError, BlockChunker, BlockSender, ClientConfig, CompactBlock, EquihashPowValidator,
+    MAX_BLOCK_BYTES, MAX_PAYLOAD_SIZE, PowResult, PowValidator, RawBlockSegment, RelayClient,
+    TargetCheck, TransportError, ZCASH_FULL_HEADER_SIZE, consensus_block_hash_display,
+    header_meets_stated_target, parse_block_body, split_raw_block, zcash_block_hash,
 };
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, watch};
 use tokio::task::JoinError;
 use tokio::time::sleep;
 use tracing::{info, warn};
+use zcash_equihash_validator::Target;
 
 use crate::block::{
     compact_block_from_parsed, compact_block_from_parsed_with_tx_cache,
     skeleton_compact_block_from_parsed,
 };
 use crate::coinbase::CoinbaseTelemetry;
-use crate::config::Config;
+use crate::config::{Config, DEFAULT_UNREADABLE_BODIES_PER_HEADER};
 use crate::error::{IngressError, Result};
+use crate::event::EventSink;
+use crate::hash::inventory_hash_to_display;
 use crate::metrics::{BlockBodyRejections, METRICS_WRITE_INTERVAL, spawn_metrics_textfile_writer};
 use crate::tx_cache::TxCache;
 use crate::wire::decode_compact_size;
@@ -56,6 +60,108 @@ struct RecentForwardedHashes {
     /// [`ForwardClaim`] removes its entry when it ends, and that closes the
     /// channel and wakes every copy waiting on it, however late they subscribed.
     in_flight: HashMap<[u8; 32], watch::Sender<()>>,
+}
+
+/// One body forwarded without validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnverifiedBody {
+    header_hash: [u8; 32],
+    digest: [u8; 32],
+}
+
+/// Bodies forwarded without validation. They never claim their header, or a forged
+/// body would hide the real one. This only stops the same bytes going out twice
+/// and bounds how many bodies one header can send, because each is a full raw send
+/// that nothing has validated. Honest copies of a block are identical, so they use
+/// one place; anyone holding a real header can use the rest.
+#[derive(Debug)]
+struct UnverifiedForwards {
+    capacity: usize,
+    window: Duration,
+    per_header: usize,
+    entries: VecDeque<(UnverifiedBody, std::time::Instant)>,
+}
+
+/// What a body found when it asked to be forwarded unverified.
+enum UnverifiedReservation {
+    Reserved,
+    Repeat,
+    HeaderFull,
+}
+
+impl Default for UnverifiedForwards {
+    fn default() -> Self {
+        Self::new(
+            64,
+            Duration::from_secs(30),
+            DEFAULT_UNREADABLE_BODIES_PER_HEADER,
+        )
+    }
+}
+
+impl UnverifiedForwards {
+    fn new(capacity: usize, window: Duration, per_header: usize) -> Self {
+        Self {
+            capacity,
+            window,
+            per_header,
+            entries: VecDeque::new(),
+        }
+    }
+
+    fn reserve(&mut self, body: UnverifiedBody, now: std::time::Instant) -> UnverifiedReservation {
+        while let Some((_, sent_at)) = self.entries.front() {
+            if now.duration_since(*sent_at) <= self.window {
+                break;
+            }
+            self.entries.pop_front();
+        }
+        if self.entries.iter().any(|(entry, _)| *entry == body) {
+            return UnverifiedReservation::Repeat;
+        }
+        let same_header = self
+            .entries
+            .iter()
+            .filter(|(entry, _)| entry.header_hash == body.header_hash)
+            .count();
+        if same_header >= self.per_header {
+            return UnverifiedReservation::HeaderFull;
+        }
+        if self.entries.len() >= self.capacity.max(self.per_header) {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((body, now));
+        UnverifiedReservation::Reserved
+    }
+
+    fn release(&mut self, body: &UnverifiedBody) {
+        self.entries.retain(|(entry, _)| entry != body);
+    }
+}
+
+/// A body's place while it is sent. Ending it any way but [`Self::commit`] gives
+/// the place back, so a failed send does not count against the header.
+struct UnverifiedSlot {
+    forwards: Arc<std::sync::Mutex<UnverifiedForwards>>,
+    body: UnverifiedBody,
+    sent: bool,
+}
+
+impl UnverifiedSlot {
+    fn commit(mut self) {
+        self.sent = true;
+    }
+}
+
+impl Drop for UnverifiedSlot {
+    fn drop(&mut self) {
+        if !self.sent {
+            self.forwards
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .release(&self.body);
+        }
+    }
 }
 
 /// Where a block stands, by its header hash.
@@ -163,7 +269,6 @@ impl ParsePermits {
 /// What a forward sends, built away from the async workers.
 struct PreparedForward {
     tx_count: usize,
-    coinbase: CoinbaseTelemetry,
     objects: PreparedObjects,
 }
 
@@ -176,6 +281,22 @@ enum PreparedObjects {
         compact_wire_bytes: usize,
         raw_fallback: Option<Vec<RawBlockSegment>>,
     },
+    /// A body the reader could not read, under the emergency bypass. The Merkle and
+    /// duplicate checks have not run on it.
+    Unverified {
+        segments: Vec<RawBlockSegment>,
+        error: BlockBodyError,
+    },
+}
+
+/// How block events name a block from the pool gateway.
+pub const POOL_GATEWAY_SOURCE: &str = "pool_gateway";
+
+/// Where block events are reported, and the source they name.
+#[derive(Clone)]
+struct BlockLog {
+    events: EventSink,
+    source: String,
 }
 
 #[derive(Clone)]
@@ -199,10 +320,18 @@ pub struct RelayBridge {
     recent_forwarded: Arc<std::sync::Mutex<RecentForwardedHashes>>,
     parse_permits: ParsePermits,
     block_body_rejections: Arc<BlockBodyRejections>,
+    /// The easiest target a peer's header may state. `from_config` always sets
+    /// it; only tests on synthetic headers leave it out.
+    peer_pow_limit: Option<Target>,
+    block_log: Option<BlockLog>,
+    /// The operator's emergency bypass: an unreadable body behind a header with a
+    /// real proof of work goes out unverified.
+    forward_unreadable_blocks: bool,
+    unverified_forwards: Arc<std::sync::Mutex<UnverifiedForwards>>,
 }
 
 impl RelayBridge {
-    pub async fn from_config(config: &Config) -> Result<Option<Self>> {
+    pub async fn from_config(config: &Config, events: EventSink) -> Result<Option<Self>> {
         if config.relay_peers.is_empty() {
             // Relay bridging is simply not configured -- distinct from a
             // misconfiguration where peers are set but the auth key is
@@ -247,6 +376,15 @@ impl RelayBridge {
             "Relay bridge enabled"
         );
         let block_body_rejections = Arc::new(BlockBodyRejections::default());
+        if config.relay_forward_unreadable_blocks {
+            warn!(
+                bodies_per_header = config.relay_unreadable_bodies_per_header,
+                "Emergency bypass on: bodies the reader cannot read are forwarded without \
+                 the Merkle and duplicate checks. Only blocks in the mainnet target range \
+                 qualify"
+            );
+            block_body_rejections.set_unverified_forward_enabled();
+        }
         if let Some(path) = &config.metrics_textfile {
             spawn_metrics_textfile_writer(
                 Arc::clone(&block_body_rejections),
@@ -275,6 +413,17 @@ impl RelayBridge {
             ))),
             parse_permits: ParsePermits::new(),
             block_body_rejections,
+            peer_pow_limit: Some(config.network.pow_limit()),
+            block_log: Some(BlockLog {
+                events,
+                source: POOL_GATEWAY_SOURCE.to_owned(),
+            }),
+            forward_unreadable_blocks: config.relay_forward_unreadable_blocks,
+            unverified_forwards: Arc::new(std::sync::Mutex::new(UnverifiedForwards::new(
+                config.relay_forward_dedup_capacity,
+                config.relay_forward_dedup_window,
+                config.relay_unreadable_bodies_per_header,
+            ))),
         }))
     }
 
@@ -306,6 +455,10 @@ impl RelayBridge {
             ))),
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
+            peer_pow_limit: None,
+            block_log: None,
+            forward_unreadable_blocks: false,
+            unverified_forwards: Default::default(),
         })
     }
 
@@ -322,6 +475,16 @@ impl RelayBridge {
         RelayClient::new(client_config).map_err(|e| IngressError::Relay(e.to_string()))
     }
 
+    /// This handle, naming `source` in its block events. The bridge as built names
+    /// the pool gateway; each peer takes a handle of its own.
+    pub fn logging_block_events(mut self, events: EventSink, source: &str) -> Self {
+        self.block_log = Some(BlockLog {
+            events,
+            source: source.to_owned(),
+        });
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn block_body_rejections(&self) -> &BlockBodyRejections {
         &self.block_body_rejections
@@ -333,17 +496,22 @@ impl RelayBridge {
         block_payload: &[u8],
         tx_cache: Option<&TxCache>,
     ) -> Result<ForwardedBlock> {
-        self.forward_with_permits(block_payload, tx_cache, &self.parse_permits.p2p)
-            .await
+        self.forward_with_permits(
+            block_payload,
+            tx_cache,
+            &self.parse_permits.p2p,
+            self.peer_pow_limit.as_ref(),
+        )
+        .await
     }
 
-    /// Forward a block from the pool gateway.
+    /// Forward a block from the pool gateway, which checks the target itself.
     pub async fn forward_pool_block(
         &self,
         block_payload: &[u8],
         tx_cache: Option<&TxCache>,
     ) -> Result<ForwardedBlock> {
-        self.forward_with_permits(block_payload, tx_cache, &self.parse_permits.pool)
+        self.forward_with_permits(block_payload, tx_cache, &self.parse_permits.pool, None)
             .await
     }
 
@@ -352,9 +520,10 @@ impl RelayBridge {
         block_payload: &[u8],
         tx_cache: Option<&TxCache>,
         permits: &Arc<Semaphore>,
+        pow_limit: Option<&Target>,
     ) -> Result<ForwardedBlock> {
         let outcome = self
-            .validate_and_forward(block_payload, tx_cache, permits)
+            .validate_and_forward(block_payload, tx_cache, permits, pow_limit)
             .await;
         if let Err(IngressError::InvalidBlockBody(error)) = &outcome {
             self.block_body_rejections.record(error);
@@ -367,6 +536,7 @@ impl RelayBridge {
         block_payload: &[u8],
         tx_cache: Option<&TxCache>,
         permits: &Arc<Semaphore>,
+        pow_limit: Option<&Target>,
     ) -> Result<ForwardedBlock> {
         // Before anything waits or copies the payload.
         if block_payload.len() > MAX_BLOCK_BYTES {
@@ -381,6 +551,16 @@ impl RelayBridge {
                     BlockBodyError::InvalidHeaderLength,
                 ))?;
 
+        // One hash, so a made-up header never reaches a parse permit. This is an
+        // anti-garbage check, not proof of work: the sender picks nBits, the
+        // solution is not verified, and a real header reused with another body
+        // passes it.
+        if let Some(pow_limit) = pow_limit
+            && header_meets_stated_target(header, pow_limit) != TargetCheck::Met
+        {
+            return Err(IngressError::InvalidBlockBody(BlockBodyError::HeaderTarget));
+        }
+
         // First-seen-wins dedup. Under steady state multiple Zcash P2P peers
         // deliver the same block within the same few hundred milliseconds.
         // Without this check each delivery re-encodes and re-broadcasts the
@@ -393,7 +573,6 @@ impl RelayBridge {
             bytes: 0,
             relay_objects: 0,
             mode: ForwardMode::Deduplicated,
-            coinbase: CoinbaseTelemetry::default(),
         };
 
         // After the dedup check, so a known header costs no parsing and a bad copy
@@ -415,6 +594,37 @@ impl RelayBridge {
             }
         };
 
+        if let PreparedObjects::Unverified { segments, error } = &prepared.objects {
+            let body = UnverifiedBody {
+                header_hash,
+                digest: segments[0].raw_block_digest,
+            };
+            let error = *error;
+            let now = std::time::Instant::now();
+            let reservation = self
+                .unverified_forwards
+                .lock()
+                .expect("unverified_forwards mutex poisoned")
+                .reserve(body, now);
+            match reservation {
+                UnverifiedReservation::Repeat => return Ok(deduplicated()),
+                UnverifiedReservation::HeaderFull => {
+                    return Err(IngressError::InvalidBlockBody(error));
+                }
+                UnverifiedReservation::Reserved => {}
+            }
+            let slot = UnverifiedSlot {
+                forwards: Arc::clone(&self.unverified_forwards),
+                body,
+                sent: false,
+            };
+            drop(permit);
+            let forwarded = self.send_prepared(prepared).await?;
+            slot.commit();
+            self.log_unverified_forward(header, &error, block_payload.len());
+            return Ok(forwarded);
+        }
+
         // Only a validated body claims the block, and a copy that lost the race
         // keeps what it prepared until the winner's send has really gone out. The
         // permit is given up with the first attempt: the next copy in the queue
@@ -425,6 +635,52 @@ impl RelayBridge {
         let forwarded = self.send_prepared(prepared).await?;
         claim.commit();
         Ok(forwarded)
+    }
+
+    /// Reported once a body has parsed, so nothing about the send can lose it, and
+    /// on the blocking pool with the parse. Best effort: a validated block goes out
+    /// whether or not this line does.
+    fn log_coinbase(&self, header: &[u8], coinbase: &CoinbaseTelemetry) {
+        let Some(log) = &self.block_log else {
+            return;
+        };
+        let hash = inventory_hash_to_display(&zcash_block_hash(header));
+        let consensus_hash = consensus_block_hash_display(header);
+        if let Err(error) =
+            log.events
+                .p2p_block_coinbase(&log.source, &hash, &consensus_hash, coinbase)
+        {
+            warn!(%error, %consensus_hash, "Failed to write the coinbase event");
+        }
+    }
+
+    /// The Merkle and duplicate checks did not run on this body; the size, header and
+    /// proof-of-work checks did. Best effort, like the coinbase line, but the counter
+    /// and the warning do not depend on the log.
+    fn log_unverified_forward(&self, header: &[u8], error: &BlockBodyError, bytes: usize) {
+        self.block_body_rejections.record_unverified_forward();
+        let consensus_hash = consensus_block_hash_display(header);
+        warn!(
+            %consensus_hash,
+            reason = error.label(),
+            bytes,
+            checks_run = "size,header,proof_of_work",
+            checks_skipped = "merkle,duplicate_txid",
+            "Forwarded a block body without the Merkle and duplicate checks"
+        );
+        let Some(log) = &self.block_log else {
+            return;
+        };
+        let hash = inventory_hash_to_display(&zcash_block_hash(header));
+        if let Err(write_error) = log.events.p2p_block_unverified_forwarded(
+            &log.source,
+            &hash,
+            &consensus_hash,
+            error,
+            bytes,
+        ) {
+            warn!(%write_error, %consensus_hash, "Failed to write the unverified forward event");
+        }
     }
 
     fn forward_state(&self, header_hash: &[u8; 32]) -> ForwardState {
@@ -508,7 +764,14 @@ impl RelayBridge {
         block: Vec<u8>,
         tx_cache: Option<&TxCache>,
     ) -> Result<PreparedForward> {
-        let parsed = parse_block_body(block).map_err(IngressError::InvalidBlockBody)?;
+        // Copied only under the bypass, the one case that needs the bytes after the
+        // reader has failed.
+        let fallback = self.forward_unreadable_blocks.then(|| block.clone());
+        let parsed = match parse_block_body(block) {
+            Ok(parsed) => parsed,
+            Err(error) => return self.prepare_unreadable(error, fallback),
+        };
+        self.log_coinbase(parsed.header(), &CoinbaseTelemetry::of(parsed.coinbase()));
         let tx_cache = tx_cache.filter(|_| self.compact_from_tx_cache);
         let compact = match tx_cache {
             Some(tx_cache) => compact_block_from_parsed_with_tx_cache(&parsed, tx_cache)?,
@@ -516,7 +779,6 @@ impl RelayBridge {
         };
         let tx_count = compact.tx_count();
         let block_hash = *compact.header_hash().as_bytes();
-        let coinbase = CoinbaseTelemetry::of(parsed.coinbase());
 
         if let Err(error) = self.preflight_chunks(&compact) {
             let text = error.to_string();
@@ -524,7 +786,6 @@ impl RelayBridge {
                 let segments = self.raw_block_segments(block_hash, parsed.raw_block())?;
                 return Ok(PreparedForward {
                     tx_count,
-                    coinbase,
                     objects: PreparedObjects::RawSegments(segments),
                 });
             }
@@ -575,7 +836,6 @@ impl RelayBridge {
         let compact_wire_bytes = BlockChunker::serialize_compact_block(&compact).len();
         Ok(PreparedForward {
             tx_count,
-            coinbase,
             objects: PreparedObjects::Compact {
                 skeleton,
                 compact,
@@ -585,13 +845,47 @@ impl RelayBridge {
         })
     }
 
+    /// The emergency bypass. Only `Transaction` qualifies: the reader stopped, so
+    /// nothing is known against the body. Every other reason is a finding about the
+    /// body and stays refused. No check here says the body belongs to its header, so
+    /// the header has to show a real proof of work; Zebra decides the rest.
+    ///
+    /// This runs on the blocking pool under the parse permit. The proof-of-work check
+    /// is the relay node's, so it covers the mainnet target range on either network:
+    /// a testnet minimum-difficulty block would stop at the first relay anyway.
+    fn prepare_unreadable(
+        &self,
+        error: BlockBodyError,
+        fallback: Option<Vec<u8>>,
+    ) -> Result<PreparedForward> {
+        let refused = IngressError::InvalidBlockBody(error);
+        let (BlockBodyError::Transaction { .. }, Some(block)) = (error, fallback) else {
+            return Err(refused);
+        };
+        let header = &block[..ZCASH_FULL_HEADER_SIZE];
+        if EquihashPowValidator.validate(header) != PowResult::Valid {
+            return Err(refused);
+        }
+        let segments = self.raw_block_segments(zcash_block_hash(header), &block)?;
+        Ok(PreparedForward {
+            tx_count: declared_tx_count(&block),
+            objects: PreparedObjects::Unverified { segments, error },
+        })
+    }
+
     async fn send_prepared(&self, prepared: PreparedForward) -> Result<ForwardedBlock> {
-        let PreparedForward {
-            tx_count,
-            coinbase,
-            objects,
-        } = prepared;
+        let PreparedForward { tx_count, objects } = prepared;
         let (compact_wire_bytes, raw_fallback) = match objects {
+            PreparedObjects::Unverified { segments, .. } => {
+                let raw_wire_bytes = self.raw_segments_wire_bytes(&segments);
+                let relay_objects = self.send_raw_block_segments(&segments).await?;
+                return Ok(ForwardedBlock {
+                    tx_count,
+                    bytes: raw_wire_bytes,
+                    relay_objects,
+                    mode: ForwardMode::RawBlockSegmentsUnverified,
+                });
+            }
             PreparedObjects::RawSegments(segments) => {
                 let raw_wire_bytes = self.raw_segments_wire_bytes(&segments);
                 let relay_objects = self.send_raw_block_segments(&segments).await?;
@@ -600,7 +894,6 @@ impl RelayBridge {
                     bytes: raw_wire_bytes,
                     relay_objects,
                     mode: ForwardMode::RawBlockSegments,
-                    coinbase,
                 });
             }
             PreparedObjects::Compact {
@@ -628,7 +921,6 @@ impl RelayBridge {
                 bytes: compact_wire_bytes,
                 relay_objects: 1,
                 mode: ForwardMode::CompactBlock,
-                coinbase,
             });
         };
         let raw_wire_bytes = self.raw_segments_wire_bytes(&segments);
@@ -638,7 +930,6 @@ impl RelayBridge {
             bytes: compact_wire_bytes + raw_wire_bytes,
             relay_objects: raw_segment_relay_objects + 1,
             mode: ForwardMode::CompactBlockWithRawFallback,
-            coinbase,
         })
     }
 
@@ -762,8 +1053,6 @@ pub struct ForwardedBlock {
     pub bytes: usize,
     pub relay_objects: usize,
     pub mode: ForwardMode,
-    /// Empty for a deduplicated delivery, which was not read.
-    pub(crate) coinbase: CoinbaseTelemetry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -771,6 +1060,10 @@ pub enum ForwardMode {
     CompactBlock,
     CompactBlockWithRawFallback,
     RawBlockSegments,
+    /// A body the reader could not read, sent under the emergency bypass. The Merkle
+    /// and duplicate checks did not run. This is the sender's local knowledge: the
+    /// segments on the wire look like any others.
+    RawBlockSegmentsUnverified,
     /// First-seen-wins dedup: this block hash was already forwarded within
     /// the dedup window, so the bridge skipped encoding and broadcast.
     /// `ForwardedBlock.relay_objects` is 0 in this case.
@@ -783,6 +1076,7 @@ impl ForwardMode {
             ForwardMode::CompactBlock => "compact_block",
             ForwardMode::CompactBlockWithRawFallback => "compact_block_with_raw_fallback",
             ForwardMode::RawBlockSegments => "raw_block_segments",
+            ForwardMode::RawBlockSegmentsUnverified => "raw_block_segments_unverified",
             ForwardMode::Deduplicated => "deduplicated",
         }
     }
@@ -829,6 +1123,10 @@ mod tests {
             ))),
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
+            peer_pow_limit: None,
+            block_log: None,
+            forward_unreadable_blocks: false,
+            unverified_forwards: Default::default(),
         }
     }
 
@@ -893,6 +1191,10 @@ mod tests {
             ))),
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
+            peer_pow_limit: None,
+            block_log: None,
+            forward_unreadable_blocks: false,
+            unverified_forwards: Default::default(),
         };
 
         let t = std::time::Instant::now();
@@ -963,6 +1265,10 @@ mod tests {
             ))),
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
+            peer_pow_limit: None,
+            block_log: None,
+            forward_unreadable_blocks: false,
+            unverified_forwards: Default::default(),
         };
 
         let forwarded = bridge
@@ -1016,6 +1322,10 @@ mod tests {
             ))),
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
+            peer_pow_limit: None,
+            block_log: None,
+            forward_unreadable_blocks: false,
+            unverified_forwards: Default::default(),
         };
 
         let forwarded = bridge
@@ -1118,6 +1428,10 @@ mod tests {
             ))),
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
+            peer_pow_limit: None,
+            block_log: None,
+            forward_unreadable_blocks: false,
+            unverified_forwards: Default::default(),
         };
         let raw_block = large_raw_block();
 
@@ -1164,6 +1478,10 @@ mod tests {
             ))),
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
+            peer_pow_limit: None,
+            block_log: None,
+            forward_unreadable_blocks: false,
+            unverified_forwards: Default::default(),
         };
         let raw_block = large_raw_block();
 
@@ -1213,6 +1531,10 @@ mod tests {
             ))),
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
+            peer_pow_limit: None,
+            block_log: None,
+            forward_unreadable_blocks: false,
+            unverified_forwards: Default::default(),
         };
         let (raw_block, _tx0, tx1) = two_tx_raw_block();
         let tx_cache = TxCache::new(TxCacheConfig {
@@ -1277,6 +1599,10 @@ mod tests {
             ))),
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
+            peer_pow_limit: None,
+            block_log: None,
+            forward_unreadable_blocks: false,
+            unverified_forwards: Default::default(),
         };
         let (raw_block, _tx0, tx1) = two_tx_raw_block();
         let tx_cache = TxCache::new(TxCacheConfig {
@@ -1330,6 +1656,10 @@ mod tests {
             ))),
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
+            peer_pow_limit: None,
+            block_log: None,
+            forward_unreadable_blocks: false,
+            unverified_forwards: Default::default(),
         };
         let (raw_block, _tx0, tx1) = two_tx_raw_block();
         let tx_cache = TxCache::new(TxCacheConfig {
@@ -1392,6 +1722,10 @@ mod tests {
             ))),
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
+            peer_pow_limit: None,
+            block_log: None,
+            forward_unreadable_blocks: false,
+            unverified_forwards: Default::default(),
         };
         let (raw_block, _tx0, _tx1) = two_tx_raw_block();
         // Empty cache => tx1 cannot resolve to a short_id => all-prefilled.
@@ -1466,6 +1800,8 @@ mod tests {
             relay_compact_from_tx_cache: false,
             relay_skeleton_first: false,
             relay_raw_fallback_with_tx_cache: false,
+            relay_forward_unreadable_blocks: false,
+            relay_unreadable_bodies_per_header: DEFAULT_UNREADABLE_BODIES_PER_HEADER,
             relay_raw_segment_send_rounds: 1,
             relay_raw_segment_round_delay_millis: 0,
             relay_forward_dedup_window: Duration::from_secs(30),
@@ -1484,7 +1820,7 @@ mod tests {
         let mut config = test_config();
         config.relay_auth_key = None;
 
-        let result = RelayBridge::from_config(&config).await;
+        let result = RelayBridge::from_config(&config, test_events()).await;
         let err = match result {
             Ok(_) => panic!("missing auth key with configured peers must error"),
             Err(err) => err,
@@ -1504,8 +1840,365 @@ mod tests {
         config.relay_peers = Vec::new();
         config.relay_auth_key = None;
 
-        let result = RelayBridge::from_config(&config).await;
+        let result = RelayBridge::from_config(&config, test_events()).await;
         assert!(matches!(result, Ok(None)));
+    }
+
+    /// The other test bridges leave the peer check off, so this is what shows the
+    /// real constructor turns it on, with the limit of its own network.
+    #[tokio::test]
+    async fn from_config_applies_the_target_check_of_its_network() {
+        use super::block_body_tests::{header_missing_its_target, header_stating, unreadable_body};
+
+        let refused = |outcome: Result<ForwardedBlock>| match outcome {
+            Err(IngressError::InvalidBlockBody(error)) => error,
+            Err(other) => panic!("expected a refusal, got {other}"),
+            Ok(forwarded) => panic!("forwarded as {}", forwarded.mode.as_str()),
+        };
+        let reached_the_reader = BlockBodyError::Transaction { index: 0 };
+        let real = unreadable_body(&zcash_pool_common::fixtures::mainnet_serialized_header());
+        let missed = unreadable_body(&header_missing_its_target());
+        let minimum_difficulty = unreadable_body(&header_stating(0x2007_ffff));
+
+        let mainnet = RelayBridge::from_config(&test_config(), test_events())
+            .await
+            .unwrap()
+            .unwrap();
+        for (raw, expected) in [
+            (&real, reached_the_reader),
+            (&missed, BlockBodyError::HeaderTarget),
+            (&minimum_difficulty, BlockBodyError::HeaderTarget),
+        ] {
+            assert_eq!(refused(mainnet.forward_block(raw, None).await), expected);
+        }
+
+        let mut config = test_config();
+        config.network = crate::wire::Network::Testnet;
+        let testnet = RelayBridge::from_config(&config, test_events())
+            .await
+            .unwrap()
+            .unwrap();
+        for (raw, expected) in [
+            (&minimum_difficulty, reached_the_reader),
+            (&missed, BlockBodyError::HeaderTarget),
+        ] {
+            assert_eq!(refused(testnet.forward_block(raw, None).await), expected);
+        }
+    }
+
+    /// The other test bridges use the default budget, so this is what shows the real
+    /// constructor takes the operator's.
+    #[tokio::test]
+    async fn from_config_uses_the_configured_body_budget() {
+        let mut config = test_config();
+        config.relay_unreadable_bodies_per_header = 7;
+        config.relay_forward_dedup_window = Duration::from_secs(11);
+
+        let bridge = RelayBridge::from_config(&config, EventSink::new(None).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let forwards = bridge.unverified_forwards.lock().unwrap();
+        assert_eq!(forwards.per_header, 7);
+        assert_eq!(forwards.window, Duration::from_secs(11));
+    }
+
+    /// The gateway checks the target itself, on any network this runs on.
+    #[tokio::test]
+    async fn from_config_leaves_the_gateway_path_alone() {
+        use super::block_body_tests::{header_missing_its_target, unreadable_body};
+
+        let bridge = RelayBridge::from_config(&test_config(), test_events())
+            .await
+            .unwrap()
+            .unwrap();
+        let raw = unreadable_body(&header_missing_its_target());
+
+        assert!(matches!(
+            bridge.forward_pool_block(&raw, None).await,
+            Err(IngressError::InvalidBlockBody(
+                BlockBodyError::Transaction { index: 0 }
+            ))
+        ));
+    }
+
+    struct AcceptingZebra {
+        submitted: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl sovright_relay_sidecar::submit::SubmitBlock for AcceptingZebra {
+        fn submit_block<'a>(
+            &'a self,
+            block_hex: &'a str,
+        ) -> sovright_relay_sidecar::submit::SubmitFuture<'a> {
+            self.submitted.lock().unwrap().push(block_hex.to_owned());
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    struct KnownParents;
+
+    impl sovright_relay_sidecar::submit_gate::ChainView for KnownParents {
+        fn tip_height(&self) -> u64 {
+            100
+        }
+
+        fn parent_known(&self, _parent_hash: &[u8; 32]) -> bool {
+            true
+        }
+    }
+
+    /// A relay node that verifies Equihash and the target, a receiving client over
+    /// UDP loopback, and a bridge from the real constructor with the bypass on.
+    struct RelayPath {
+        node: Arc<sovright_relay::RelayNode>,
+        node_task: tokio::task::JoinHandle<std::result::Result<(), TransportError>>,
+        receiver_task: tokio::task::JoinHandle<std::result::Result<(), TransportError>>,
+        receiver: sovright_relay::BlockReceiver,
+        bridge: RelayBridge,
+    }
+
+    impl RelayPath {
+        async fn start() -> Self {
+            use sovright_relay::{AuthKey, RelayConfig, RelayNode};
+
+            let auth_key = [0x42; 32];
+            let node_config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+                .with_authorized_keys(vec![AuthKey::new("fleet", auth_key)]);
+            let mut node = RelayNode::new(node_config).unwrap();
+            node.bind().await.unwrap();
+            let node_addr = node.local_addr().unwrap();
+            let node = Arc::new(node);
+            let running_node = Arc::clone(&node);
+            let node_task = tokio::spawn(async move { running_node.run().await });
+            sleep(Duration::from_millis(50)).await;
+
+            let mut receiving_client = RelayClient::new(
+                ClientConfig::new(vec![node_addr], auth_key).with_auth_required(true),
+            )
+            .unwrap();
+            receiving_client.bind().await.unwrap();
+            let (receiver, outgoing) = receiving_client.take_receiver().unwrap();
+            let receiver_task =
+                tokio::spawn(async move { receiving_client.run_with_outgoing(outgoing).await });
+            sleep(Duration::from_millis(200)).await;
+
+            let mut config = test_config();
+            config.relay_peers = vec![node_addr];
+            config.relay_auth_key = Some(auth_key);
+            config.relay_data_shards = 10;
+            config.relay_parity_shards = 3;
+            config.relay_forward_unreadable_blocks = true;
+            let events = EventSink::new(None).unwrap();
+            let bridge = RelayBridge::from_config(&config, events)
+                .await
+                .unwrap()
+                .unwrap();
+            sleep(Duration::from_millis(100)).await;
+            Self {
+                node,
+                node_task,
+                receiver_task,
+                receiver,
+                bridge,
+            }
+        }
+
+        async fn stop(self) {
+            self.node.stop();
+            self.receiver_task.abort();
+            let _ = self.node_task.await;
+        }
+    }
+
+    /// The first body of a header is delivered, and the second never crosses the
+    /// relay, because object ids are bound to the header and not to the body. Quotas
+    /// are not what stops it here: both bodies were sent. A later block shows the
+    /// path is still working. This is the open delivery race in #130.
+    #[tokio::test]
+    async fn known_gap_a_second_body_of_one_header_does_not_cross_the_relay() {
+        use super::block_body_tests::unreadable_block;
+        use sovright_relay::reassemble_raw_block;
+
+        let mut path = RelayPath::start().await;
+        let forged = unreadable_block(40_000, 1);
+        let real = unreadable_block(40_000, 2);
+        let later = super::nu7_fixture::Nu7Fixture::load().raw;
+        for raw in [&forged, &real] {
+            let forwarded = path.bridge.forward_block(raw, None).await.unwrap();
+            assert_eq!(forwarded.mode, ForwardMode::RawBlockSegmentsUnverified);
+        }
+        path.bridge.forward_block(&later, None).await.unwrap();
+
+        let later_header = &later[..ZCASH_FULL_HEADER_SIZE];
+        let mut segments = Vec::new();
+        loop {
+            let payload =
+                tokio::time::timeout(Duration::from_secs(5), path.receiver.recv_payload())
+                    .await
+                    .expect("the later block crosses the relay")
+                    .expect("the receiver stays open");
+            match payload {
+                sovright_relay::RelayPayload::RawBlockSegment(segment) => segments.push(segment),
+                sovright_relay::RelayPayload::CompactBlock(compact)
+                    if compact.header == later_header =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(reassemble_raw_block(&segments).unwrap(), forged);
+        path.stop().await;
+    }
+
+    /// The whole way, on real components: the real constructor, raw segmentation, a
+    /// relay node that verifies the header's Equihash solution and target, a
+    /// receiving client over UDP loopback, reassembly, and the sidecar deciding for
+    /// itself. A helper returning `Ok` would show none of this.
+    #[tokio::test]
+    async fn an_unreadable_block_crosses_the_relay_and_reaches_zebra() {
+        use sovright_relay::reassemble_raw_block;
+        use sovright_relay_sidecar::submit::{
+            RelayBlockError, SubmissionOutcome, SubmitBlockMode, SubmitBlockStatus,
+            UnverifiedLimits, submit_unverified_raw_block, unreadable_body,
+            validate_then_gate_raw_block,
+        };
+        use sovright_relay_sidecar::submit_gate::{
+            CandidateMeta, GateConfig, ParentObservation, SubmitGate,
+        };
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let mut path = RelayPath::start().await;
+        let raw = super::block_body_tests::unreadable_block(40_000, 1);
+        let forwarded = path.bridge.forward_block(&raw, None).await.unwrap();
+        assert_eq!(forwarded.mode, ForwardMode::RawBlockSegmentsUnverified);
+        assert!(forwarded.relay_objects > 1, "several segments");
+
+        let mut segments = Vec::new();
+        loop {
+            let segment = tokio::time::timeout(
+                Duration::from_secs(5),
+                path.receiver.recv_raw_block_segment(),
+            )
+            .await
+            .expect("the relay delivers the segments")
+            .expect("the receiver stays open");
+            let expected = segment.segment_count as usize;
+            segments.push(segment);
+            if segments.len() == expected {
+                break;
+            }
+        }
+        let received = reassemble_raw_block(&segments).unwrap();
+        assert_eq!(received, raw, "the bytes survive the relay");
+
+        let block_hash = zcash_block_hash(&raw[..ZCASH_FULL_HEADER_SIZE]);
+        let zebra = AcceptingZebra {
+            submitted: Default::default(),
+        };
+        let gate = tokio::sync::Mutex::new(SubmitGate::new(
+            GateConfig {
+                enabled: true,
+                ..GateConfig::default()
+            },
+            KnownParents,
+        ));
+        let parent = || async {
+            Some(ParentObservation {
+                parent_hash: CandidateMeta::parent_hash_from_header(&raw[..ZCASH_FULL_HEADER_SIZE])
+                    .unwrap(),
+                height: 100,
+                confirmations: Some(1),
+            })
+        };
+
+        // A sidecar with its own switch off refuses what the sender forwarded.
+        let strict = validate_then_gate_raw_block(
+            &zebra,
+            &received,
+            Some(block_hash),
+            SubmitBlockMode::Live,
+            &gate,
+            parent,
+        )
+        .await;
+        assert!(matches!(
+            strict,
+            Err(RelayBlockError::InvalidBlockBody(
+                BlockBodyError::Transaction { index: 1 }
+            ))
+        ));
+        assert!(zebra.submitted.lock().unwrap().is_empty());
+
+        let error = unreadable_body(&strict).expect("the bypass may take this one");
+        let bypassed = AtomicU64::new(0);
+        let limits = UnverifiedLimits {
+            budget: Duration::from_secs(5),
+            bypassed: &bypassed,
+        };
+        let outcome = submit_unverified_raw_block(
+            &zebra,
+            &received,
+            error,
+            SubmitBlockMode::Live,
+            &gate,
+            limits,
+            parent,
+        )
+        .await;
+
+        match outcome {
+            Ok(SubmissionOutcome::Submitted { status, candidate }) => {
+                assert_eq!(status, SubmitBlockStatus::Accepted);
+                assert_eq!(
+                    candidate.unverified,
+                    Some(BlockBodyError::Transaction { index: 1 })
+                );
+            }
+            Ok(_) => panic!("the block did not reach Zebra"),
+            Err(error) => panic!("the block did not reach Zebra: {error}"),
+        }
+        assert_eq!(*zebra.submitted.lock().unwrap(), [hex::encode(&raw)]);
+        assert_eq!(bypassed.load(Ordering::Relaxed), 1);
+        path.stop().await;
+    }
+
+    /// `main` hands the bridge straight to the gateway, so the real constructor is
+    /// what has to name it. The line is written before the send, so its outcome
+    /// does not matter here.
+    #[tokio::test]
+    async fn from_config_names_the_gateway_in_its_coinbase_events() {
+        let log = std::env::temp_dir().join(format!(
+            "sovright-p2p-gateway-coinbase-{}.jsonl",
+            std::process::id()
+        ));
+        let events = EventSink::new(Some(log.clone())).unwrap();
+        let bridge = RelayBridge::from_config(&test_config(), events)
+            .await
+            .unwrap()
+            .unwrap();
+        let raw = zcash_pool_common::fixtures::mainnet_raw_block();
+
+        let _ = bridge.forward_pool_block(&raw, None).await;
+
+        let lines = std::fs::read_to_string(&log).unwrap();
+        let coinbase: serde_json::Value = lines
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["event"] == "p2p_block_coinbase")
+            .expect("a coinbase line");
+        assert_eq!(coinbase["peer"], POOL_GATEWAY_SOURCE);
+        assert_eq!(
+            coinbase["consensus_hash"],
+            consensus_block_hash_display(&raw[..ZCASH_FULL_HEADER_SIZE])
+        );
+    }
+
+    fn test_events() -> EventSink {
+        EventSink::new(None).unwrap()
     }
 
     #[test]

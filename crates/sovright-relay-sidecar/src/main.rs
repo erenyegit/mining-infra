@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -31,8 +31,9 @@ use sovright_relay_sidecar::metrics_textfile::write_metrics_textfile;
 use sovright_relay_sidecar::rpc::ZebraRpc;
 use sovright_relay_sidecar::submit::{
     RelayBlockError, SubmissionOutcome, SubmitBlock, SubmitBlockMode, SubmitBlockStatus,
-    SubmitRejectionClass, handle_relay_compact_block, handle_relay_compact_block_with_mempool,
-    handle_relay_raw_block, validate_then_gate_compact_block, validate_then_gate_raw_block,
+    SubmitRejectionClass, UnverifiedLimits, handle_relay_compact_block,
+    handle_relay_compact_block_with_mempool, handle_relay_raw_block, submit_unverified_raw_block,
+    unreadable_body, validate_then_gate_compact_block, validate_then_gate_raw_block,
 };
 use sovright_relay_sidecar::submit_gate::SubmitGate;
 use tokio::sync::Mutex as TokioMutex;
@@ -415,6 +416,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // is always None. The ZebraChainView feeds the gate's parent-known
         // check and is shared so we can also use it for parent-height lookups
         // on each candidate before invoking the gated handler.
+        let unreadable_submit = submit_gate_cfg
+            .as_ref()
+            .and_then(UnreadableSubmit::from_config);
+        if let Some(unreadable) = &unreadable_submit {
+            warn!(
+                budget = ?unreadable.budget,
+                "Emergency bypass on: raw blocks this sidecar cannot read go to Zebra without \
+                 the Merkle and duplicate checks. Only blocks in the mainnet target range \
+                 qualify"
+            );
+            metrics
+                .unreadable_submit_enabled
+                .store(true, Ordering::Relaxed);
+        }
         let (gate, chain_view) = if let Some(cfg) = submit_gate_cfg.as_ref().filter(|c| c.enabled) {
             let chain_view = ZebraChainView::new(ZebraChainViewConfig::default());
             // Spawn the polling task; drop the JoinHandle since the view's
@@ -442,6 +457,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Arc::clone(&mempool),
             gate,
             chain_view,
+            unreadable_submit,
         ))
     } else {
         relay.start().await?;
@@ -691,6 +707,7 @@ fn spawn_relay_block_handler<M>(
     mempool: Arc<M>,
     gate: Option<Arc<TokioMutex<SubmitGate<Arc<ZebraChainView>>>>>,
     chain_view: Option<Arc<ZebraChainView>>,
+    unreadable_submit: Option<UnreadableSubmit>,
 ) -> tokio::task::JoinHandle<()>
 where
     M: MempoolProvider + Send + Sync + 'static,
@@ -872,6 +889,32 @@ where
                                                 )
                                                 .await
                                             };
+                                            if let (
+                                                Some(error),
+                                                Some(unreadable),
+                                                Some(gate),
+                                                Some(chain_view),
+                                            ) = (
+                                                unreadable_body(&raw_outcome),
+                                                &unreadable_submit,
+                                                &gate,
+                                                &chain_view,
+                                            ) {
+                                                // Off the receive task, which must keep
+                                                // reading while Zebra judges this.
+                                                unreadable.spawn(UnverifiedSubmission {
+                                                    submitter: Arc::clone(&submitter),
+                                                    rpc: Arc::clone(&rpc),
+                                                    gate: Arc::clone(gate),
+                                                    chain_view: Arc::clone(chain_view),
+                                                    metrics: Arc::clone(&metrics),
+                                                    mode,
+                                                    raw_block,
+                                                    error,
+                                                    first_seen,
+                                                });
+                                                continue;
+                                            }
                                             if gate.is_some()
                                                 && matches!(
                                                     raw_outcome,
@@ -1388,6 +1431,94 @@ fn expire_raw_segment_buffer(
     expired_count
 }
 
+/// The emergency bypass, as the receive task runs it: each attempt on a task of its
+/// own, so nothing else waits on Zebra.
+#[derive(Clone)]
+struct UnreadableSubmit {
+    budget: Duration,
+    /// One permit per attempt running, across all blocks. Attempts per block do not
+    /// bound this, because each new header brings its own.
+    running: Arc<tokio::sync::Semaphore>,
+}
+
+/// One reassembled block on its way through the bypass.
+struct UnverifiedSubmission {
+    submitter: Arc<DualSubmit<Arc<ZebraRpc>>>,
+    rpc: Arc<ZebraRpc>,
+    gate: Arc<TokioMutex<SubmitGate<Arc<ZebraChainView>>>>,
+    chain_view: Arc<ZebraChainView>,
+    metrics: Arc<SidecarMetrics>,
+    mode: SubmitBlockMode,
+    raw_block: Vec<u8>,
+    error: BlockBodyError,
+    first_seen: Instant,
+}
+
+impl UnreadableSubmit {
+    /// `None` unless the bypass is on, which also needs the gate.
+    fn from_config(config: &config::SubmitGateConfig) -> Option<Self> {
+        (config.enabled && config.submit_unreadable_blocks).then(|| {
+            Self::new(
+                Duration::from_secs(config.unreadable_submit_budget_secs),
+                config.unreadable_attempts_per_block,
+            )
+        })
+    }
+
+    fn new(budget: Duration, max_running: usize) -> Self {
+        Self {
+            budget,
+            running: Arc::new(tokio::sync::Semaphore::new(max_running)),
+        }
+    }
+
+    fn spawn(&self, submission: UnverifiedSubmission) {
+        let Ok(permit) = Arc::clone(&self.running).try_acquire_owned() else {
+            warn!("Emergency bypass is at its limit; refusing an unreadable block");
+            submission.metrics.inc_submit_gate_rejected(
+                sovright_relay_sidecar::submit_gate::RejectReason::UnverifiedLimit,
+            );
+            return;
+        };
+        let budget = self.budget;
+        tokio::spawn(async move {
+            let _permit = permit;
+            let UnverifiedSubmission {
+                submitter,
+                rpc,
+                gate,
+                chain_view,
+                metrics,
+                mode,
+                raw_block,
+                error,
+                first_seen,
+            } = submission;
+            let outcome = submit_unverified_raw_block(
+                submitter.as_ref(),
+                &raw_block,
+                error,
+                mode,
+                gate.as_ref(),
+                UnverifiedLimits {
+                    budget,
+                    bypassed: &metrics.block_body_unverified,
+                },
+                || chain_view.observe_candidate_parent(rpc.as_ref(), &raw_block),
+            )
+            .await;
+            if matches!(
+                outcome,
+                Ok(SubmissionOutcome::DryRun(_)) | Ok(SubmissionOutcome::Submitted { .. })
+            ) {
+                metrics.inc_submit_gate_accepted();
+            }
+            let first_seen_to_submit_ms = first_seen.elapsed().as_millis() as u64;
+            log_submission_outcome(outcome, metrics.as_ref(), Some(first_seen_to_submit_ms));
+        });
+    }
+}
+
 fn log_submission_outcome(
     outcome: Result<SubmissionOutcome, sovright_relay_sidecar::submit::RelayBlockError>,
     metrics: &SidecarMetrics,
@@ -1647,6 +1778,9 @@ struct SidecarMetrics {
     submit_gate_rejected_unknown_parent: AtomicU64,
     submit_gate_rejected_out_of_window: AtomicU64,
     submit_gate_rejected_duplicate: AtomicU64,
+    submit_gate_rejected_unverified_limit: AtomicU64,
+    block_body_unverified: AtomicU64,
+    unreadable_submit_enabled: AtomicBool,
     raw_segment_incomplete_blocks: AtomicUsize,
     raw_segment_payload_bytes: AtomicUsize,
     tx_cache_entries: AtomicUsize,
@@ -1850,6 +1984,9 @@ impl SidecarMetrics {
             }
             sovright_relay_sidecar::submit_gate::RejectReason::DuplicateSubmit => {
                 &self.submit_gate_rejected_duplicate
+            }
+            sovright_relay_sidecar::submit_gate::RejectReason::UnverifiedLimit => {
+                &self.submit_gate_rejected_unverified_limit
             }
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -2165,6 +2302,19 @@ impl SidecarMetrics {
             submit_gate_rejected_out_of_window = submit_gate_rejected_out_of_window,
             submit_gate_rejected_duplicate = submit_gate_rejected_duplicate,
         );
+        text.push_str(&format!(
+            "sovright_relay_sidecar_submit_gate_rejected_total{{reason=\"unverified_limit\"}} {}\n",
+            self.submit_gate_rejected_unverified_limit
+                .load(Ordering::Relaxed)
+        ));
+        text.push_str(&format!(
+            "# TYPE sovright_relay_sidecar_relay_block_body_unverified_total counter\n\
+             sovright_relay_sidecar_relay_block_body_unverified_total {}\n\
+             # TYPE sovright_relay_sidecar_unreadable_block_submit_enabled gauge\n\
+             sovright_relay_sidecar_unreadable_block_submit_enabled {}\n",
+            self.block_body_unverified.load(Ordering::Relaxed),
+            u8::from(self.unreadable_submit_enabled.load(Ordering::Relaxed))
+        ));
         text.push_str("# TYPE sovright_relay_sidecar_relay_block_body_rejected_total counter\n");
         for (kind, count) in BlockBodyError::ALL.iter().zip(&self.block_body_rejections) {
             text.push_str(&format!(
@@ -2521,6 +2671,7 @@ mod tests {
             Arc::new(EmptyMempool),
             None,
             None,
+            None,
         );
 
         let valid = zcash_pool_common::fixtures::mainnet_raw_block();
@@ -2577,6 +2728,290 @@ mod tests {
                 .load(Ordering::Relaxed),
             1
         );
+    }
+
+    /// The real receive task, from UDP through the raw buffer to the decision, with
+    /// a client whose chunks the test sends by hand.
+    struct ReceiveTask {
+        peer: tokio::net::UdpSocket,
+        peer_addr: SocketAddr,
+        client_addr: SocketAddr,
+        client_task: tokio::task::JoinHandle<Result<(), sovright_relay::TransportError>>,
+        handler_task: tokio::task::JoinHandle<()>,
+        metrics: Arc<SidecarMetrics>,
+    }
+
+    const TEST_KEY: [u8; 32] = [0x42; 32];
+
+    impl ReceiveTask {
+        /// The gate is disabled, so the tests need no chain behind it; the lib tests
+        /// cover its decisions.
+        async fn start(
+            zebra_url: &str,
+            mode: SubmitBlockMode,
+            unreadable_submit: Option<UnreadableSubmit>,
+        ) -> Self {
+            use sovright_relay::{ClientConfig, RelayClient};
+            let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let peer_addr = peer.local_addr().unwrap();
+            let mut client = RelayClient::new(
+                ClientConfig::new(vec![peer_addr], TEST_KEY)
+                    .with_bind_addr("127.0.0.1:0".parse().unwrap())
+                    .with_fec(2, 1),
+            )
+            .unwrap();
+            client.bind().await.unwrap();
+            let client_addr = client.local_addr().unwrap();
+            let (receiver, outgoing) = client.take_receiver().unwrap();
+            let client_task = tokio::spawn(async move { client.run_with_outgoing(outgoing).await });
+            let rpc = Arc::new(ZebraRpc::new(zebra_url).await.unwrap());
+            let submitter = Arc::new(DualSubmit::primary_only(Arc::clone(&rpc), "unused", None));
+            let metrics = Arc::new(SidecarMetrics::default());
+            let chain_view = ZebraChainView::new(ZebraChainViewConfig::default());
+            let gate = Arc::new(TokioMutex::new(SubmitGate::new(
+                Default::default(),
+                Arc::clone(&chain_view),
+            )));
+            let handler_task = spawn_relay_block_handler(
+                receiver,
+                rpc,
+                submitter,
+                mode,
+                false,
+                buffer_config(8, 65536, Duration::from_secs(60)),
+                Arc::clone(&metrics),
+                Arc::new(EmptyMempool),
+                Some(gate),
+                Some(chain_view),
+                unreadable_submit,
+            );
+            Self {
+                peer,
+                peer_addr,
+                client_addr,
+                client_task,
+                handler_task,
+                metrics,
+            }
+        }
+
+        async fn send(&self, raw: &[u8]) {
+            use sovright_relay::{BlockChunker, Chunk, ChunkHeader, RelaySession};
+            let hash = zcash_block_hash(&raw[..ZCASH_FULL_HEADER_SIZE]);
+            let chunker = BlockChunker::new(2, 1).unwrap();
+            let session = RelaySession::new(self.peer_addr, "test", TEST_KEY);
+            for segment in split_raw_block(hash, raw, 2048).unwrap() {
+                for chunk in chunker.raw_block_segment_to_chunks(&segment).unwrap() {
+                    let h = &chunk.header;
+                    let mac = session.compute_hmac(
+                        &h.block_hash,
+                        h.chunk_id,
+                        h.total_chunks,
+                        h.payload_len,
+                        &chunk.payload,
+                    );
+                    let header = ChunkHeader::new_raw_block_segment_authenticated(
+                        &h.block_hash,
+                        h.chunk_id,
+                        h.total_chunks,
+                        h.payload_len,
+                        mac,
+                    );
+                    self.peer
+                        .send_to(
+                            &Chunk::new(header, chunk.payload).to_bytes(),
+                            self.client_addr,
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+
+        async fn wait_for(&self, what: &str, done: impl Fn(&SidecarMetrics) -> bool) {
+            let settled = tokio::time::timeout(Duration::from_secs(5), async {
+                while !done(&self.metrics) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            assert!(settled.is_ok(), "{what} never happened");
+        }
+
+        fn stop(self) -> Arc<SidecarMetrics> {
+            self.client_task.abort();
+            self.handler_task.abort();
+            self.metrics
+        }
+    }
+
+    fn refused_as_unreadable(metrics: &SidecarMetrics) -> u64 {
+        let index = BlockBodyError::Transaction { index: 0 }.kind_index();
+        metrics.block_body_rejections[index].load(Ordering::Relaxed)
+    }
+
+    fn unreadable_block() -> Vec<u8> {
+        let txs = zcash_pool_common::fixtures::mainnet_transactions();
+        let mut unknown = 0x8000_0007u32.to_le_bytes().to_vec();
+        unknown.extend_from_slice(&0x7a7a_7a7au32.to_le_bytes());
+        unknown.resize(400, 0x5a);
+        let mut raw = zcash_pool_common::fixtures::mainnet_serialized_header();
+        raw.push(2);
+        raw.extend_from_slice(&txs[0]);
+        raw.extend_from_slice(&unknown);
+        raw
+    }
+
+    #[tokio::test]
+    async fn the_receive_task_refuses_an_unreadable_block_by_default() {
+        let task = ReceiveTask::start("http://127.0.0.1:1", SubmitBlockMode::DryRun, None).await;
+
+        task.send(&unreadable_block()).await;
+        task.wait_for("the refusal", |metrics| refused_as_unreadable(metrics) == 1)
+            .await;
+
+        let metrics = task.stop();
+        assert_eq!(metrics.submit_dry_run_candidates.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.block_body_unverified.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn the_receive_task_takes_an_unreadable_block_under_the_bypass() {
+        let bypass = UnreadableSubmit::new(Duration::from_secs(5), 4);
+        let task =
+            ReceiveTask::start("http://127.0.0.1:1", SubmitBlockMode::DryRun, Some(bypass)).await;
+
+        task.send(&unreadable_block()).await;
+        task.wait_for("the dry run", |metrics| {
+            metrics.submit_dry_run_candidates.load(Ordering::Relaxed) == 1
+        })
+        .await;
+
+        let metrics = task.stop();
+        assert_eq!(metrics.block_body_unverified.load(Ordering::Relaxed), 1);
+        assert_eq!(refused_as_unreadable(&metrics), 0);
+    }
+
+    /// A Zebra that answers everything except this one body, which it never answers.
+    async fn zebra_holding(held: String) -> (String, jsonrpsee::server::ServerHandle) {
+        use jsonrpsee::server::{RpcModule, ServerBuilder};
+        use jsonrpsee::types::ErrorObjectOwned;
+
+        let mut module = RpcModule::new(held);
+        module
+            .register_async_method("submitblock", |params, held, _| async move {
+                let (block_hex,): (String,) = params.parse()?;
+                if block_hex == *held {
+                    std::future::pending::<()>().await;
+                }
+                Ok::<Option<String>, ErrorObjectOwned>(None)
+            })
+            .unwrap();
+        module
+            .register_method("getblockheader", |_, _, _| {
+                Err::<(), ErrorObjectOwned>(ErrorObjectOwned::owned(-5, "not found", None::<()>))
+            })
+            .unwrap();
+        let server = ServerBuilder::default()
+            .http_only()
+            .build("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        (url, server.start(module))
+    }
+
+    /// The real receive task and real RPC client: while Zebra sits on the unverified
+    /// body, the task reads the next block and gets it accepted.
+    #[tokio::test]
+    async fn the_receive_task_keeps_going_while_zebra_holds_an_unverified_body() {
+        let held = unreadable_block();
+        let (url, _zebra) = zebra_holding(hex::encode(&held)).await;
+        let bypass = UnreadableSubmit::new(Duration::from_secs(30), 4);
+        let task = ReceiveTask::start(&url, SubmitBlockMode::Live, Some(bypass)).await;
+
+        task.send(&held).await;
+        task.wait_for("the attempt", |metrics| {
+            metrics.block_body_unverified.load(Ordering::Relaxed) == 1
+        })
+        .await;
+        // Another header: a second body of this one would stop at the client, which is
+        // the upstream limit and not what this shows.
+        let txs = [parseable_transaction(9)];
+        let mut valid = header_committing_to(&txs);
+        valid.push(1);
+        valid.extend_from_slice(&txs[0]);
+        task.send(&valid).await;
+
+        task.wait_for("the valid block", |metrics| {
+            metrics.submit_successes.load(Ordering::Relaxed) == 1
+        })
+        .await;
+        task.stop();
+    }
+
+    /// Attempts per block do not bound this, because each new header brings its own.
+    #[tokio::test]
+    async fn the_receive_task_runs_only_so_many_attempts_at_once() {
+        let held = unreadable_block();
+        let (url, _zebra) = zebra_holding(hex::encode(&held)).await;
+        let bypass = UnreadableSubmit::new(Duration::from_secs(30), 1);
+        let task = ReceiveTask::start(&url, SubmitBlockMode::Live, Some(bypass.clone())).await;
+        let _running = Arc::clone(&bypass.running).acquire_owned().await.unwrap();
+
+        task.send(&held).await;
+        task.wait_for("the refusal", |metrics| {
+            metrics
+                .submit_gate_rejected_unverified_limit
+                .load(Ordering::Relaxed)
+                == 1
+        })
+        .await;
+
+        let metrics = task.stop();
+        assert_eq!(metrics.block_body_unverified.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_bypass_takes_its_limits_from_the_config_and_needs_the_gate() {
+        let config = config::SubmitGateConfig {
+            enabled: true,
+            submit_unreadable_blocks: true,
+            unreadable_attempts_per_block: 3,
+            unreadable_submit_budget_secs: 7,
+            ..Default::default()
+        };
+
+        let bypass = UnreadableSubmit::from_config(&config).expect("it is on");
+        assert_eq!(bypass.budget, Duration::from_secs(7));
+        assert_eq!(bypass.running.available_permits(), 3);
+
+        for off in [
+            config::SubmitGateConfig {
+                enabled: false,
+                ..config.clone()
+            },
+            config::SubmitGateConfig {
+                submit_unreadable_blocks: false,
+                ..config
+            },
+        ] {
+            assert!(UnreadableSubmit::from_config(&off).is_none());
+        }
+    }
+
+    #[test]
+    fn the_bypass_has_its_own_metrics() {
+        let metrics = SidecarMetrics::default();
+        metrics.block_body_unverified.store(3, Ordering::Relaxed);
+        metrics
+            .unreadable_submit_enabled
+            .store(true, Ordering::Relaxed);
+
+        let text = metrics.render_prometheus_text();
+
+        assert!(text.contains("sovright_relay_sidecar_relay_block_body_unverified_total 3\n"));
+        assert!(text.contains("sovright_relay_sidecar_unreadable_block_submit_enabled 1\n"));
     }
 
     #[test]

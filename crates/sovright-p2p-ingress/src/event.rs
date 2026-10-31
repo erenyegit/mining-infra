@@ -47,6 +47,16 @@ impl EventSink {
         }
     }
 
+    /// A sink whose writes fail: the file is open for reading only.
+    #[cfg(test)]
+    pub(crate) fn unwritable() -> Self {
+        let file = File::open(std::env::current_exe().unwrap()).unwrap();
+        Self {
+            network: crate::wire::Network::Mainnet,
+            target: EventTarget::File(Arc::new(Mutex::new(file))),
+        }
+    }
+
     pub fn p2p_peer_connected(&self, peer: &str) -> Result<()> {
         self.write(json!({
             "event": "p2p_peer_connected",
@@ -287,10 +297,13 @@ impl EventSink {
         }))
     }
 
-    /// Who mined a block, once its coinbase has been read off the async workers.
-    /// It enriches the `p2p_block_received` line with the same `hash` rather than
-    /// repeating it, so counting receipts still counts each delivery once. With
-    /// nothing to report it writes nothing.
+    /// Who mined a block, once its coinbase has been read off the async workers and
+    /// the body validated. Written before the send, so a failed send keeps it.
+    /// It is best effort, with no exactly-once guarantee: join it on
+    /// `consensus_hash`, per block and idempotently. It is not a receipt. A copy that
+    /// takes over after a failed send writes another line, which can carry a
+    /// different `miner_tag`, because one hash does not mean one body. With nothing
+    /// to report it writes nothing.
     pub fn p2p_block_coinbase(
         &self,
         peer: &str,
@@ -322,6 +335,33 @@ impl EventSink {
             value["miner_tag"] = json!(miner_tag);
         }
         self.write(value)
+    }
+
+    /// A body the reader could not read, sent on under the emergency bypass. The size,
+    /// header and proof-of-work checks ran. The Merkle and duplicate checks could not,
+    /// so nothing here says the body belongs to this header. A repeat among the
+    /// transactions read before the failure is refused, but that does not cover the
+    /// body, so `duplicate_txid` is listed as skipped.
+    pub fn p2p_block_unverified_forwarded(
+        &self,
+        peer: &str,
+        hash: &str,
+        consensus_hash: &str,
+        error: &BlockBodyError,
+        bytes: usize,
+    ) -> Result<()> {
+        self.write(json!({
+            "event": "p2p_block_unverified_forwarded",
+            "peer": peer,
+            "hash": hash,
+            "consensus_hash": consensus_hash,
+            "reason": error.label(),
+            "detail": error.to_string(),
+            "checks_run": ["size", "header", "proof_of_work"],
+            "checks_skipped": ["merkle", "duplicate_txid"],
+            "bytes": bytes,
+            "observed_at_unix_ms": now_unix_ms(),
+        }))
     }
 
     pub fn p2p_relay_block_forwarded(

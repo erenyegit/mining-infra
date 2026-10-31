@@ -405,7 +405,6 @@ mod tests {
                     Err(IngressError::Relay("relay unavailable".to_string()))
                 } else {
                     Ok(ForwardedBlock {
-                        coinbase: Default::default(),
                         tx_count: 1,
                         bytes: 128,
                         relay_objects: 1,
